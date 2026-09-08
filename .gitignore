@@ -1,0 +1,17 @@
+# Secrets & local config — never commit.
+# Students paste their Gemini key into the page's Key field (kept in the
+# browser). config.js also holds the local relay URL; keep it out of git.
+config.js
+
+# macOS
+.DS_Store
+
+# Cloudflare Wrangler local state for the relay in files/ (account cache, tmp,
+# dev vars) — contains your account id, never commit it.
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Dependencies / environments
+node_modules/
+.venv/

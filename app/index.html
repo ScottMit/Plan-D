@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plan D — Expressive Robot</title>
+    <script src="https://cdn.jsdelivr.net/npm/p5@1.11.10/lib/p5.js"></script>
+    <!-- style.css with a ?v cache-buster so CSS edits show on a normal reload —
+         a local static server sends no cache headers (same reason as the app
+         scripts at the end of <body>). Written during head parse so it still
+         blocks render (no flash of unstyled content). -->
+    <script>document.write('<link rel="stylesheet" href="style.css?v=' + Date.now() + '">');</script>
+</head>
+<body>
+<main>
+    <div id="top">
+        <div class="brand">Plan D</div>
+        <div class="heading">Expressive Robot</div>
+        <div class="note" style="color:#6d6a5f;font-size:.9rem;margin:.5rem 0 .2rem;">
+            Push-to-talk: press <b>SPACE</b>, say one thing, and the robot thinks, moves, and replies.
+            Set <code>USE_ROBOT&nbsp;=&nbsp;false</code> in <code>config.js</code> to run with the on-canvas face only.
+        </div>
+    </div>
+
+    <!-- Live settings. Students can try these mid-session without touching the
+         code: each <select> just updates CONFIG, and the next turn uses it.
+         Wired up in sketch.js → wireControls() (one line per control). -->
+    <div id="controls">
+        <div class="row">
+            <span class="lbl">Key</span>
+            <input id="gemini-key" class="grow" type="password" autocomplete="off"
+                   name="plan-d-key" placeholder="paste your own Gemini API key">
+        </div>
+        <div class="row">
+            <span class="lbl"></span>
+            <span class="mut">Get one free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.</span>
+        </div>
+        <div class="row">
+            <span class="lbl">Model</span>
+            <!-- Hardcoded from this key's available models (the text/chat ones).
+                 Some WILL error on purpose — e.g. gemini-2.5-flash is retired for
+                 new keys and returns a 404. Pick it and watch the ⚠ line below
+                 the face explain exactly why. Model availability changes often;
+                 refresh this list from https://ai.google.dev/gemini-api/docs/models -->
+            <select id="sel-model">
+                <optgroup label="Gemini 3 — current">
+                    <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+                    <option value="gemini-3.7-flash">gemini-3.7-flash</option>
+                    <option value="gemini-3.6-flash">gemini-3.6-flash (default)</option>
+                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                    <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                </optgroup>
+                <optgroup label="Aliases — always point at a current model">
+                    <option value="gemini-flash-latest">gemini-flash-latest</option>
+                    <option value="gemini-flash-lite-latest">gemini-flash-lite-latest</option>
+                    <option value="gemini-pro-latest">gemini-pro-latest</option>
+                </optgroup>
+                <optgroup label="Gemini 2.5 — older (may error)">
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                    <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                </optgroup>
+                <optgroup label="Gemma — open models (structured output may differ)">
+                    <option value="gemma-4-31b-it">gemma-4-31b-it</option>
+                    <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
+                </optgroup>
+            </select>
+        </div>
+        <div class="row">
+            <span class="lbl">Thinking</span>
+            <select id="sel-thinking">
+                <option value="minimal">minimal — fastest reply</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high — slower, more considered</option>
+            </select>
+            <!-- shown by sketch.js when the chosen model isn't a Gemini 3 one -->
+            <span id="thinking-note" class="mut" hidden>Gemini 3 only — ignored for this model</span>
+        </div>
+        <div class="row">
+            <span class="lbl">Voice</span>
+            <select id="sel-lang">
+                <option value="en-US">English — US</option>
+                <option value="en-GB">English — UK</option>
+                <option value="en-AU">English — Australia</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- The system prompt, in editable parts. These three fields + the auto-
+         inserted gesture list are joined into the instruction sent to Gemini
+         (brain.js → systemInstruction). Edits save to this browser and apply on
+         the next turn. Wired in sketch.js → wireControls(). -->
+    <details id="prompt-panel">
+        <summary>System prompt — rewrite how the robot behaves</summary>
+        <p class="mut">
+            The three parts below are joined, with your authored <b>gesture list</b> inserted
+            between “Reply style” and “Output rules”, and sent to Gemini as the system
+            instruction. Changes save in this browser and take effect on the next turn.
+            <button type="button" id="prompt-reset">Reset to default</button>
+        </p>
+
+        <label class="field">
+            <span>Persona — who the robot is</span>
+            <textarea id="prompt-persona" rows="3"></textarea>
+        </label>
+
+        <label class="field">
+            <span>Reply style — how it should answer</span>
+            <textarea id="prompt-task" rows="4"></textarea>
+        </label>
+
+        <label class="field">
+            <span>Gesture list — inserted automatically from your authored gestures (read-only)</span>
+            <textarea id="prompt-gestures" rows="5" readonly></textarea>
+        </label>
+
+        <label class="field">
+            <span>Output rules — intensity, gaze, and the no-inventing-gestures rule</span>
+            <textarea id="prompt-rules" rows="4"></textarea>
+        </label>
+    </details>
+
+    <!-- The p5 canvas mounts here (sketch.js → createCanvas().parent('stage')),
+         so the talk-to-the-robot input and the status bar sit BELOW the face. -->
+    <div id="stage"></div>
+
+    <div id="below">
+        <div id="status">Fill in config.js (copy config.example.js), then press SPACE. Serve over http://localhost so the mic works.</div>
+        <div id="say-box">
+            <textarea id="say" rows="2" autocomplete="off"
+                      placeholder="Type to the robot — Enter to send, Shift+Enter for a new line (or press SPACE to talk)"></textarea>
+            <button id="send" class="primary" type="button">Send</button>
+        </div>
+    </div>
+</main>
+
+<!-- App scripts, loaded in order. The ?v=<timestamp> busts the browser cache so
+     your edits show up on a normal reload: a local static server (e.g.
+     python -m http.server) sends no cache headers, so without this the browser
+     can keep running an OLD copy of a file you just changed. p5 above is left
+     un-busted so it stays cached from the CDN. -->
+<script>
+    [
+        'lib/pardalote.js',  // Pardalote library (vendored bundle)
+        'connect.js',        // shared WiFi / USB connection UI
+        'config.js',         // your settings — gitignored; copy config.example.js
+        'gestures.js',       // the authored gesture vocabulary (you edit this)
+        'robot.js',          // Pardalote hardware adapter
+        'brain.js',          // the Gemini call + response parsing
+        'sketch.js',         // p5 setup/draw, speech, the state machine
+    ].forEach((src) => document.write(`<script src="${src}?v=${Date.now()}"><\/script>`));
+</script>
+</body>
+</html>

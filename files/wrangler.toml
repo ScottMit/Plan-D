@@ -1,0 +1,9 @@
+# wrangler.toml — configuration for the keyless Gemini relay.
+# Rename "gemini-relay" if you like; the name becomes part of your public URL:
+#   https://<name>.<your-subdomain>.workers.dev
+
+name = "gemini-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# No [vars] and no secrets — this relay deliberately stores nothing.

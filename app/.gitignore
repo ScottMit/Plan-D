@@ -1,0 +1,6 @@
+# secrets & local settings
+config.js
+
+# os cruft
+.DS_Store
+node_modules/
