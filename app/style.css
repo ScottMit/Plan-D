@@ -194,6 +194,39 @@ canvas {
 .row .mut a { color: var(--teal); }
 .row select:disabled { color: #a49f92; background: #efece4; cursor: not-allowed; }
 
+/* ---- read-only response-schema panel (teaching surface) ---- */
+#schema-panel {
+    width: 100%;
+    max-width: 560px;
+    margin: 0 0 16px;
+    padding: 4px 14px 12px;
+    background: var(--paper);
+    border: 1.5px solid var(--hair);
+}
+#schema-panel > summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--ink);
+    padding: 8px 0;
+}
+#schema-panel .mut { display: block; font-size: 11.5px; color: var(--grey); line-height: 1.5; margin: 0 0 10px; }
+#schema-panel .mut code { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); }
+.schema-code {
+    margin: 0;
+    padding: 10px 12px;
+    background: #f6f3ec;
+    border: 1.5px solid var(--hair);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink);
+    overflow-x: auto;
+    white-space: pre;
+}
+
 /* ---- editable system-prompt panel ---- */
 #prompt-panel {
     width: 100%;
@@ -229,6 +262,106 @@ canvas {
     resize: vertical;
 }
 .field textarea[readonly] { color: var(--grey); background: #f6f3ec; cursor: default; }
+
+/* ---- Gestures panel ---- */
+#gestures-panel {
+    width: 100%;
+    max-width: 560px;
+    margin: 0 0 16px;
+    padding: 4px 14px 12px;
+    background: var(--paper);
+    border: 1.5px solid var(--hair);
+}
+#gestures-panel > summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--ink);
+    padding: 8px 0;
+}
+.gpanel-head { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 12px; }
+.gpanel-head .mut { flex: 1; font-size: 11.5px; color: var(--grey); line-height: 1.5; }
+.gpanel-btns { flex: none; display: flex; gap: 6px; }
+.gpanel-head button { flex: none; padding: 4px 12px; }
+
+/* one card per gesture */
+.gcard {
+    border: 1.5px solid var(--hair);
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    background: var(--paper);
+}
+.gcard-hidden { background: #f6f3ec; }            /* hidden-from-LLM poses read muted */
+.gcard-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.gcard-name {
+    flex: 1; min-width: 0;
+    font-family: var(--mono); font-size: 13px; font-weight: 700;
+    padding: 4px 7px; height: 30px;
+    background: var(--paper); color: var(--ink); border: 1.5px solid var(--line);
+}
+.gcard-desc {
+    width: 100%; box-sizing: border-box;
+    font-size: 12.5px; padding: 4px 7px; height: 28px; margin-bottom: 6px;
+    background: var(--paper); color: var(--ink-soft); border: 1.5px solid var(--hair);
+}
+.gcard-lanes {
+    width: 100%; box-sizing: border-box;
+    font-family: var(--mono); font-size: 12px; line-height: 1.45;
+    padding: 7px 8px; resize: vertical;
+    background: var(--paper); color: var(--ink); border: 1.5px solid var(--line);
+}
+
+/* compact icon buttons in the card header */
+.gicon {
+    flex: none; width: 30px; height: 30px; padding: 0;
+    font-size: 14px; line-height: 1; text-align: center;
+    border: 1.5px solid var(--line); background: var(--paper); cursor: pointer;
+}
+.gicon:hover { background: var(--ink); }
+.gicon-play { border-color: var(--line); }
+.gicon-play:hover { background: var(--green); border-color: var(--green); color: #fff; }
+.gicon-del:hover { background: var(--red); border-color: var(--red); }
+
+/* the ⚙ tune popup (scale / speed / crop), collapsed by default */
+.gtune {
+    margin-top: 8px; padding: 8px; border: 1.5px dashed var(--hair); background: #faf8f2;
+}
+.gtune-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.gtune-row:last-child { margin-bottom: 0; }
+.gtune-lbl { flex: none; width: 44px; font-size: 11px; font-weight: 700; color: var(--ink-soft); }
+.gtune-row input[type=range] { flex: 1; accent-color: var(--teal); }
+.gtune-row .mut { flex: none; min-width: 62px; text-align: right; font-family: var(--mono); font-size: 11.5px; color: var(--grey); }
+
+/* two <input type=range> stacked over one track → a dual-handle crop slider.
+   The inputs are transparent (their thumbs show); the fill bar sits between the
+   two thumb positions, driven by --lo / --hi custom properties set in JS. */
+.dual-range { position: relative; flex: 1; height: 32px; min-width: 220px; }
+.dual-track {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    height: 4px; background: var(--hair); border: 1px solid var(--line);
+}
+.dual-fill {
+    position: absolute; top: 0; bottom: 0;
+    left: var(--lo, 0%); right: calc(100% - var(--hi, 100%));
+    background: var(--teal);
+}
+.dual-range input[type=range] {
+    position: absolute; left: 0; top: 0; width: 100%; height: 100%; margin: 0;
+    background: none; pointer-events: none;   /* the track catches nothing; thumbs re-enable below */
+    -webkit-appearance: none; appearance: none;
+}
+.dual-range input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; pointer-events: auto;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--paper); border: 2px solid var(--ink); cursor: pointer;
+}
+.dual-range input[type=range]::-moz-range-thumb {
+    pointer-events: auto;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--paper); border: 2px solid var(--ink); cursor: pointer;
+}
 
 /* ---- talk-to-the-robot input (below the canvas, matched to its width) ---- */
 #below { width: 640px; max-width: 100%; margin-bottom: 20px; }   /* matches the canvas width */

@@ -39,7 +39,8 @@ const MAX_HISTORY = 8;         // keep the last few turns for context
 let lastUser = '';             // last thing heard (shown on canvas)
 let lastReply = '';            // last thing said
 let lastGesture = '';          // last gesture played
-let lastIntensity = 0;
+let lastScale = 1;
+let lastSpeed = 1;
 let lastError = '';            // last API/parse failure reason (shown in red)
 let lastTiming = null;         // { think, speak, total, network, parse } in ms
 let statusLine = 'idle — press SPACE to talk';
@@ -74,9 +75,12 @@ function setup() {
     createCanvas(W, H).parent('stage');   // canvas sits above the Type row + status
     textFont('system-ui');
 
+    loadGestures();                       // overlay any saved gesture edits before anything reads them
     Robot.setup(CONFIG.USE_ROBOT, setStatus);
     initSpeech();
     wireControls();
+    wireGesturePanel();
+    renderSchema();
 
     setState(STATE.IDLE);
 }
@@ -153,6 +157,297 @@ function wirePromptEditor(el) {
             if (ta) ta.value = d[part];
         }
     });
+}
+
+// The Gestures panel: one editable card per authored gesture (from gestures.js)
+// — its name, description, and lanes (the segment schedule). Paste a gesture from
+// the Pardalote Gesture Builder into a Lanes field to try your own. Per-gesture
+// controls are compact icons; scale/speed/crop live in a ⚙ popup so cards stay
+// small. This first cut SURFACES + PLAYS the (possibly edited) lanes; persisting
+// edits back to gestures.js is a later step.
+function wireGesturePanel() {
+    const panel = document.getElementById('gestures-panel');
+    const list = document.getElementById('gesture-cards');
+    if (!panel || !list || typeof GESTURES === 'undefined') return;
+
+    const parkBtn = document.getElementById('g-park');
+    if (parkBtn) parkBtn.addEventListener('click', () => Robot.park());
+
+    const addBtn = document.getElementById('g-add');
+    if (addBtn) addBtn.addEventListener('click', () => {
+        // A new, unsaved card seeded with a minimal template to paste over.
+        const card = buildGestureCard('', { desc: '', lanes: { tilt: [{ by: 0, dur: 300, curve: 'easeInOut' }] } });
+        list.appendChild(card);
+        card.scrollIntoView({ block: 'nearest' });
+        card.querySelector('.gcard-name').focus();
+    });
+
+    const resetBtn = document.getElementById('g-reset');
+    if (resetBtn) resetBtn.addEventListener('click', () => {
+        if (!confirm('Discard your saved gesture edits and restore the authored gestures?')) return;
+        applyGestureSet(authoredGestures);
+        try { localStorage.removeItem(GESTURE_STORE); } catch (e) {}
+        renderGestureCards();
+        refreshGestureMirror();
+        setStatus('gestures reset to the authored defaults');
+    });
+
+    renderGestureCards();
+}
+
+// (Re)build one card per gesture from the live GESTURES.
+function renderGestureCards() {
+    const list = document.getElementById('gesture-cards');
+    if (!list) return;
+    list.innerHTML = '';
+    for (const name of Object.keys(GESTURES)) list.appendChild(buildGestureCard(name, GESTURES[name]));
+}
+
+// Keep the read-only gesture list in the prompt panel in step with edits (the LLM
+// itself reads GESTURES fresh each turn, so this is just the on-screen mirror).
+// The schema's gesture enum changes with the vocabulary too, so refresh it here.
+function refreshGestureMirror() {
+    const glist = document.getElementById('prompt-gestures');
+    if (glist) glist.value = Robot.gestureCatalogue().map((g) => `- ${g.name}: ${g.desc}`).join('\n');
+    renderSchema();
+}
+
+// Render the read-only Response schema panel — the exact structured-output shape
+// the model must return (Brain.responseSchema()), pretty-printed. A teaching
+// surface: the API enforces this shape, separate from the editable system prompt.
+function renderSchema() {
+    const el = document.getElementById('schema-view');
+    if (!el || !(typeof Brain !== 'undefined') || !Brain.responseSchema) return;
+    try { el.textContent = JSON.stringify(Brain.responseSchema(), null, 2); }
+    catch (e) { el.textContent = '// could not read the schema'; }
+}
+
+// -------------------------------------------------------------------
+// Gesture library persistence. Authored gestures live in gestures.js; the panel
+// lets you edit / paste / add your own. Saving APPLIES the edit to the live
+// GESTURES object (the robot's playGesture and the LLM's vocabulary both read it
+// fresh, so it takes effect at once) and PERSISTS the whole set to this browser's
+// localStorage, overlaying the authored defaults on the next load. Reset clears it.
+// -------------------------------------------------------------------
+const GESTURE_STORE = 'plan-d-gestures';
+let authoredGestures = null;   // deep snapshot of the file's defaults, for Reset
+
+function snapshotGestures() { return JSON.parse(JSON.stringify(GESTURES)); }
+
+// Replace the live GESTURES contents in place (it's a shared const object other
+// modules hold by reference, so we mutate rather than reassign), in `set`'s order.
+function applyGestureSet(set) {
+    for (const k of Object.keys(GESTURES)) delete GESTURES[k];
+    for (const [k, v] of Object.entries(set)) {
+        GESTURES[k] = { desc: v.desc || '', lanes: v.lanes || {} };
+        if (v.hidden) GESTURES[k].hidden = true;
+    }
+}
+
+function saveGestures() {
+    try { localStorage.setItem(GESTURE_STORE, JSON.stringify(snapshotGestures())); } catch (e) {}
+}
+
+// Snapshot the authored defaults, then overlay saved edits. Call once, before
+// anything reads the gesture vocabulary.
+function loadGestures() {
+    if (typeof GESTURES === 'undefined') return;
+    authoredGestures = snapshotGestures();
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(GESTURE_STORE) || 'null'); } catch (e) {}
+    if (saved && typeof saved === 'object' && !Array.isArray(saved) && Object.keys(saved).length) {
+        const ok = Object.values(saved).every((v) => v && typeof v === 'object' && v.lanes && typeof v.lanes === 'object');
+        if (ok) applyGestureSet(saved);
+        else console.warn('[gestures] saved set looks malformed — using authored defaults');
+    }
+}
+
+// Format a lanes object as the same JS the Gesture Builder emits and gestures.js
+// uses — unquoted keys, single-quoted curves — so it round-trips by copy/paste.
+function formatLanes(lanes) {
+    const seg = (s) => {
+        const v = s.by !== undefined ? `by: ${s.by}` : (s.to !== undefined ? `to: ${s.to}` : `value: ${s.value || 0}`);
+        return `{ ${v}, dur: ${s.dur}, curve: '${s.curve}' }`;
+    };
+    const keys = Object.keys(lanes || {});
+    const out = ['{'];
+    keys.forEach((k, i) => {
+        out.push(`  ${k}: [`);
+        (lanes[k] || []).forEach((s) => out.push(`    ${seg(s)},`));
+        out.push(`  ]${i < keys.length - 1 ? ',' : ''}`);
+    });
+    out.push('}');
+    return out.join('\n');
+}
+
+// Parse a Lanes field: tolerate a pasted "const gesture = { … };" (the Builder's
+// export) or a bare object literal, with unquoted keys / single quotes / trailing
+// commas (JS, not strict JSON). Throws on bad input (caught by the caller). It's a
+// local authoring field the user types into by hand, so evaluating it is fine.
+function parseLanes(text) {
+    let t = String(text || '').trim();
+    t = t.replace(/^\s*(?:const|let|var)\s+[\w$]+\s*=\s*/, '').replace(/;\s*$/, '').trim();
+    return new Function('return (' + t + ');')();   // eslint-disable-line no-new-func
+}
+
+// Build one gesture card: name + desc + lanes fields, and ▶ play / ⚙ tune / 👁
+// hidden icon controls.
+function buildGestureCard(name, g) {
+    const card = document.createElement('div');
+    card.className = 'gcard' + (g.hidden ? ' gcard-hidden' : '');
+    let key = name || null;   // this gesture's current key in GESTURES; null until first save
+
+    const head = document.createElement('div');
+    head.className = 'gcard-head';
+
+    const nameEl = document.createElement('input');
+    nameEl.type = 'text'; nameEl.className = 'gcard-name'; nameEl.value = name;
+    nameEl.placeholder = 'gesture_name';
+
+    const hideBtn = document.createElement('button');
+    hideBtn.type = 'button'; hideBtn.className = 'gicon';
+    let hidden = !!g.hidden;
+    const showHide = () => { hideBtn.textContent = hidden ? '🙈' : '👁'; hideBtn.title = hidden ? 'hidden from the LLM' : 'offered to the LLM'; };
+    showHide();
+    hideBtn.addEventListener('click', () => { hidden = !hidden; showHide(); card.classList.toggle('gcard-hidden', hidden); });
+
+    const playBtn = document.createElement('button');
+    playBtn.type = 'button'; playBtn.className = 'gicon gicon-play'; playBtn.textContent = '▶'; playBtn.title = 'play';
+
+    const tuneBtn = document.createElement('button');
+    tuneBtn.type = 'button'; tuneBtn.className = 'gicon'; tuneBtn.textContent = '⚙'; tuneBtn.title = 'scale · speed · crop';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button'; saveBtn.className = 'gicon'; saveBtn.textContent = '💾'; saveBtn.title = 'save (apply + remember in this browser)';
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button'; delBtn.className = 'gicon gicon-del'; delBtn.textContent = '🗑'; delBtn.title = 'delete';
+
+    head.append(nameEl, hideBtn, playBtn, tuneBtn, saveBtn, delBtn);
+
+    const descEl = document.createElement('input');
+    descEl.type = 'text'; descEl.className = 'gcard-desc'; descEl.value = g.desc || '';
+    descEl.placeholder = 'description (shown to the LLM)';
+
+    const lanesEl = document.createElement('textarea');
+    lanesEl.className = 'gcard-lanes'; lanesEl.spellcheck = false; lanesEl.rows = 5;
+    lanesEl.value = formatLanes(g.lanes);
+
+    const tune = buildTunePanel();
+    tune.wrap.hidden = true;
+    tuneBtn.addEventListener('click', () => { tune.wrap.hidden = !tune.wrap.hidden; });
+
+    let busy = false;
+    playBtn.addEventListener('click', async () => {
+        if (busy) return;
+        if (state !== STATE.IDLE) { setStatus('finish the current turn first'); return; }
+        let lanes;
+        try { lanes = parseLanes(lanesEl.value); }
+        catch (e) { setStatus(`couldn't read the lanes for "${nameEl.value}" — check the syntax`); return; }
+        // Build a library Gesture from the field's lanes, tuned by the ⚙ controls.
+        const gx = Gesture.from(lanes).scale(tune.scale()).speed(tune.speed()).crop(tune.cropLo(), tune.cropHi());
+        const dur = Math.max(1, gx.duration());
+        busy = true;
+        setStatus(`playing ${nameEl.value} · scale ${tune.scale().toFixed(2)} · speed ${tune.speed().toFixed(2)} · crop ${Math.round(tune.cropLo() * 100)}–${Math.round(tune.cropHi() * 100)}% · ${dur} ms`);
+        startFaceGesture(nameEl.value, dur);
+        try { await Robot.play(gx); } catch (e) { /* Robot.play reports */ }
+        if (gx.cropped) await Robot.park();   // cropped gestures end off-home
+        gestureAnim = null; busy = false;
+        if (state === STATE.IDLE) setStatus('idle — press SPACE to talk');
+    });
+
+    // Save — apply the card's fields to the live GESTURES (the robot's playGesture
+    // and the LLM's vocabulary both read it fresh) and persist. Handles rename
+    // (preserving key order) and first-save of a new card.
+    saveBtn.addEventListener('click', () => {
+        const newName = nameEl.value.trim();
+        if (!newName) { setStatus('give the gesture a name'); nameEl.focus(); return; }
+        let lanes;
+        try { lanes = parseLanes(lanesEl.value); }
+        catch (e) { setStatus(`couldn't read the lanes for "${newName}" — check the syntax`); return; }
+        if (newName !== key && Object.prototype.hasOwnProperty.call(GESTURES, newName)) {
+            setStatus(`a gesture named "${newName}" already exists`); return;
+        }
+        const entry = { desc: descEl.value.trim(), lanes };
+        if (hidden) entry.hidden = true;
+        if (key && key !== newName) {
+            // rename in place, preserving key order
+            const entries = Object.entries(GESTURES).map(([k, v]) => [k === key ? newName : k, k === key ? entry : v]);
+            for (const k of Object.keys(GESTURES)) delete GESTURES[k];
+            for (const [k, v] of entries) GESTURES[k] = v;
+        } else {
+            GESTURES[newName] = entry;   // update existing, or append a new one
+        }
+        key = newName;
+        lanesEl.value = formatLanes(lanes);   // reflect the normalised form
+        saveGestures();
+        refreshGestureMirror();
+        setStatus(`saved "${newName}"`);
+    });
+
+    // Delete — remove from GESTURES (if it was saved) and persist; drop the card.
+    delBtn.addEventListener('click', () => {
+        if (key && !confirm(`Delete gesture "${key}"?`)) return;
+        if (key && Object.prototype.hasOwnProperty.call(GESTURES, key)) {
+            delete GESTURES[key]; saveGestures(); refreshGestureMirror();
+        }
+        card.remove();
+        setStatus(key ? `deleted "${key}"` : 'removed');
+    });
+
+    card.append(head, descEl, lanesEl, tune.wrap);
+    return card;
+}
+
+// The ⚙ tune popup: per-card scale / speed / crop controls. Returns getters for
+// the current values (crop as 0..1 fractions).
+function buildTunePanel() {
+    const wrap = document.createElement('div');
+    wrap.className = 'gtune';
+
+    const row = (label, ...nodes) => {
+        const r = document.createElement('div'); r.className = 'gtune-row';
+        const l = document.createElement('span'); l.className = 'gtune-lbl'; l.textContent = label;
+        r.append(l, ...nodes); return r;
+    };
+    const range = (min, max, step, val) => {
+        const i = document.createElement('input');
+        i.type = 'range'; i.min = min; i.max = max; i.step = step; i.value = val; return i;
+    };
+    const readout = () => { const s = document.createElement('span'); s.className = 'mut'; return s; };
+
+    const scaleR = range('0.1', '1.5', '0.05', '1'), scaleV = readout();
+    const showScale = () => scaleV.textContent = (+scaleR.value).toFixed(2) + '×';
+    scaleR.addEventListener('input', showScale); showScale();
+
+    const speedR = range('0.25', '2', '0.05', '1'), speedV = readout();
+    const showSpeed = () => speedV.textContent = (+speedR.value).toFixed(2) + '×';
+    speedR.addEventListener('input', showSpeed); showSpeed();
+
+    // dual-handle crop (two overlaid ranges + a fill bar)
+    const cropWrap = document.createElement('div'); cropWrap.className = 'dual-range';
+    const track = document.createElement('div'); track.className = 'dual-track';
+    const fill = document.createElement('div'); fill.className = 'dual-fill'; track.append(fill);
+    const lo = range('0', '100', '1', '0'), hi = range('0', '100', '1', '100');
+    cropWrap.append(track, lo, hi);
+    const cropV = readout();
+    const showCrop = () => {
+        let a = +lo.value, b = +hi.value;
+        if (a > b - 1) { if (document.activeElement === lo) a = b - 1; else b = a + 1; lo.value = a; hi.value = b; }
+        cropWrap.style.setProperty('--lo', a + '%');
+        cropWrap.style.setProperty('--hi', b + '%');
+        cropV.textContent = `${a}–${b}%`;
+    };
+    lo.addEventListener('input', showCrop); hi.addEventListener('input', showCrop); showCrop();
+
+    wrap.append(row('scale', scaleR, scaleV), row('speed', speedR, speedV), row('crop', cropWrap, cropV));
+    return {
+        wrap,
+        scale:  () => +scaleR.value,
+        speed:  () => +speedR.value,
+        cropLo: () => (+lo.value) / 100,
+        cropHi: () => (+hi.value) / 100,
+    };
 }
 
 // Enable the Thinking dropdown only when the chosen model supports thinkingLevel
@@ -295,7 +590,8 @@ async function runTurn(text, sttMs = null) {
 
     lastReply = directive.speech;
     lastGesture = directive.gesture;
-    lastIntensity = directive.intensity;
+    lastScale = directive.scale;
+    lastSpeed = directive.speed;
     // Show a fallback's reason on screen (so failures aren't silent), and clear
     // it on the next successful turn — a good directive has no `error`, so this
     // resets to '' automatically.
@@ -318,8 +614,8 @@ async function runTurn(text, sttMs = null) {
     setStatus('speaking…');
 
     // Gesture and speech together.
-    startFaceGesture(directive.gesture, gestureDurationGuess(directive.gesture));
-    const gesturePromise = Robot.playGesture(directive.gesture, directive.intensity, directive.gaze);
+    startFaceGesture(directive.gesture, gestureDurationGuess(directive.gesture, directive.speed));
+    const gesturePromise = Robot.playGesture(directive.gesture, directive.scale, directive.gaze, directive.speed);
     const speechPromise = speak(directive.speech);
 
     await Promise.all([gesturePromise, speechPromise]);
@@ -370,16 +666,17 @@ function startFaceGesture(name, duration) {
 }
 
 // Rough duration for the face when we don't have the exact lane total handy.
-function gestureDurationGuess(name) {
+// `speed` (the LLM's tempo) divides the total, matching what the board plays.
+function gestureDurationGuess(name, speed = 1) {
     const g = (typeof GESTURES !== 'undefined') && GESTURES[name];
-    if (!g) return 1200;
-    const lanes = g.build(1);
+    if (!g || !g.lanes) return 1200;
     let max = 0;
-    for (const segs of Object.values(lanes)) {
+    for (const segs of Object.values(g.lanes)) {
         const t = segs.reduce((n, s) => n + Math.max(1, s.dur || 0), 0);
         if (t > max) max = t;
     }
-    return max || 1200;
+    const sp = Number(speed) > 0 ? Number(speed) : 1;
+    return Math.max(1, Math.round((max || 1200) / sp));
 }
 
 // Resolve the current face pose from gaze + the running gesture envelope.
@@ -497,9 +794,9 @@ function drawReadout() {
     fill(INK); textSize(14);
     text(lastReply || '—', x, top + 75, colW, 44);
 
-    // gesture + intensity
+    // gesture + scale + speed
     fill(GREY); textSize(12);
-    const gline = lastGesture ? `gesture: ${lastGesture}   intensity: ${lastIntensity.toFixed(2)}` : 'gesture: —';
+    const gline = lastGesture ? `gesture: ${lastGesture}   scale: ${lastScale.toFixed(2)}×   speed: ${lastSpeed.toFixed(2)}×` : 'gesture: —';
     text(gline, x, top + 128);
 
     // timing line — the trip up to the response, broken into parts. STT only

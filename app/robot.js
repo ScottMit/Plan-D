@@ -6,9 +6,10 @@
 // through a Pardalote GROUP so a gesture's joints move and arrive phase-locked.
 //
 // The one method the rest of the app calls to move:
-//   playGesture(name, intensity, gaze) -> Promise<{ name, duration }>
-// It looks the gesture up in GESTURES (gestures.js), scales it by intensity,
-// biases the head toward `gaze` (optional), and plays it via group.gesture().
+//   playGesture(name, scale, gaze, speed) -> Promise<{ name, duration }>
+// It looks the gesture up in GESTURES (gestures.js), reshapes it by scale
+// (amplitude) and speed (tempo), biases the head toward `gaze` (optional), and
+// plays it via group.gesture().
 // It resolves when the motion lands, so callers can await/sequence it.
 //
 // When USE_ROBOT is false — or the board simply isn't connected yet — there is
@@ -43,9 +44,21 @@ const Robot = (() => {
     const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    // Amplitude scale from the LLM's intensity: even a low intensity still
-    // reads as motion (floor ~0.4), a high one is emphatic (~1.15 at 1.0).
-    const scaleFor = (intensity) => 0.4 + 0.75 * clamp01(intensity);
+    // Amplitude multiplier from the LLM's scale lever — straight into
+    // Gesture.scale() (1 = as authored, <1 smaller/subtler, >1 bigger/emphatic).
+    // Clamped so a wild value can't invert or overshoot the joints; missing → 1.
+    const scaleFor = (scale) => {
+        const n = Number(scale);
+        return Number.isFinite(n) ? Math.max(0.2, Math.min(1.5, n)) : 1.0;
+    };
+
+    // Tempo multiplier from the LLM's speed: a playback rate straight into
+    // Gesture.speed() (1 = as authored, >1 quicker, <1 slower). Clamped so a
+    // wild value can't stall or blur the motion; missing → 1.
+    const speedFor = (speed) => {
+        const n = Number(speed);
+        return Number.isFinite(n) ? Math.max(0.5, Math.min(2.0, n)) : 1.0;
+    };
 
     // The longest lane's total time — how long the whole gesture takes. Used
     // for the no-hardware timing and as the whenDone() timeout budget.
@@ -143,19 +156,45 @@ const Robot = (() => {
     function currentGaze() { return { ...gaze }; }
 
     // --- the one move method ------------------------------------------
-    // Play a named gesture. Resolves { name, duration } when it lands.
-    async function playGesture(name, intensity = 0.6, gazeBias = null) {
+    // Wrap a named authored gesture as a Pardalote Gesture at FULL amplitude
+    // (build(1)), so callers can chain manipulations before playing:
+    //   Robot.gesture('nod_yes').scale(0.7).speed(0.5).crop(0.2, 0.8)
+    // `Gesture` is the library's own chainable object (from pardalote.js) — Plan-D
+    // no longer carries its own transform code. Works with no board too (it's just
+    // a value; hardware isn't touched until group.gesture() plays it).
+    // Unknown names fall back to the rest gesture (same as playGesture).
+    function gesture(name) {
         const g = GESTURES[name] || GESTURES[REST_GESTURE];
+        return Gesture.from(g.lanes);
+    }
+
+    // Play a named gesture. Resolves { name, duration } when it lands. The LLM's
+    // scale and speed levers reshape the authored gesture via the library
+    // modifiers: scale → .scale() (amplitude), speed → .speed() (tempo). Same
+    // path the Gestures panel's per-card controls use.
+    async function playGesture(name, scale = 1, gazeBias = null, speed = 1) {
         const usedName = GESTURES[name] ? name : REST_GESTURE;
-        const lanes = g.build(scaleFor(intensity));
-        const duration = laneDuration(lanes);
+        const g = gesture(usedName).scale(scaleFor(scale)).speed(speedFor(speed));
+        const { duration } = await play(g, gazeBias);
+        return { name: usedName, duration };
+    }
+
+    // Play a Gesture (library object) or a raw lanes object. group.gesture()
+    // accepts either and applies any scale/speed/crop mods the Gesture carries.
+    // Applies gaze first, then plays, resolving { duration } when it lands. NOTE:
+    // a cropped Gesture is no longer net-zero — call park() after (Gesture.cropped
+    // tells you when).
+    async function play(input, gazeBias = null) {
+        const duration = (input && typeof input.duration === 'function')
+            ? input.duration()          // a Gesture — its post-mod duration
+            : laneDuration(input);      // a raw lanes object
 
         if (gazeBias) setGaze(gazeBias);
 
         if (!hardwareReady) {
             // No board: keep the loop's timing honest so the face animates right.
             await wait(duration + (gazeBias ? 200 : 0));
-            return { name: usedName, duration };
+            return { duration };
         }
 
         // Orient the head toward the person first (quick), then play the
@@ -165,11 +204,11 @@ const Robot = (() => {
             catch (e) { /* a slow/again move shouldn't block the gesture */ }
         }
         try {
-            await group.gesture(lanes).whenDone({ timeout: duration + 1500 });
+            await group.gesture(input).whenDone({ timeout: duration + 1500 });
         } catch (e) {
             onStatus('gesture timed out (board busy?)');
         }
-        return { name: usedName, duration };
+        return { duration };
     }
 
     // Return to a calm home pose, biased by the last gaze. Awaitable.
@@ -203,7 +242,7 @@ const Robot = (() => {
 
     return {
         setup, isReady,
-        playGesture, park, stop,
+        gesture, play, playGesture, park, stop,
         gestureNames, gestureCatalogue, hasGesture,
         currentGaze, setEyes,
         FILLER_GESTURE, REST_GESTURE,

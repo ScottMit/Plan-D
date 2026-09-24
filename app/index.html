@@ -89,6 +89,23 @@
         </div>
     </div>
 
+    <!-- The response schema (read-only) — the exact JSON shape Gemini must return.
+         A teaching surface for structured output: the API enforces this shape, so
+         it's separate from the System prompt below (which guides the values).
+         Rendered in sketch.js → renderSchema() from Brain.responseSchema(). -->
+    <details id="schema-panel">
+        <summary>Response schema — the exact shape the model must return</summary>
+        <p class="mut">
+            The robot asks Gemini for <b>structured output</b>: every reply must match this JSON
+            schema, and the API <b>enforces</b> it — so the chosen <code>gesture</code> is always
+            one that exists and the <code>scale</code>/<code>speed</code> levers are always present.
+            The schema fixes the <b>shape</b> (fields, types, what's required); the
+            <b>System&nbsp;prompt</b> below guides the <b>values</b> (which gesture, how big/fast,
+            what to say). It updates automatically as you add or hide gestures.
+        </p>
+        <pre class="schema-code"><code id="schema-view"></code></pre>
+    </details>
+
     <!-- The system prompt, in editable parts. These three fields + the auto-
          inserted gesture list are joined into the instruction sent to Gemini
          (brain.js → systemInstruction). Edits save to this browser and apply on
@@ -121,6 +138,25 @@
             <span>Output rules — intensity, gaze, and the no-inventing-gestures rule</span>
             <textarea id="prompt-rules" rows="4"></textarea>
         </label>
+    </details>
+
+    <!-- Gestures. Each authored gesture (from gestures.js) is surfaced as an
+         editable card: its name, description, and the lanes (segment schedule).
+         Paste a gesture from the Pardalote Gesture Builder into a Lanes field —
+         name the builder rows pan / tilt / antL / antR to match the joints.
+         Per-gesture controls (play, tune) are compact icons; scale/speed/crop
+         live in a ⚙ popup. Built in sketch.js → wireGesturePanel(). -->
+    <details id="gestures-panel">
+        <summary>Gestures — view, paste, and try your own</summary>
+        <div class="gpanel-head">
+            <span class="mut">Paste a gesture from the <b>Pardalote Gesture Builder</b> into a Lanes field. Name its rows <b>pan</b> / <b>tilt</b> / <b>antL</b> / <b>antR</b>. ▶ play · ⚙ tune · 👁 LLM-visible · 💾 save · 🗑 delete. Saved edits stay in this browser.</span>
+            <div class="gpanel-btns">
+                <button id="g-add" type="button" title="Add a new gesture">+ Add</button>
+                <button id="g-park" type="button" title="Return to rest">Park</button>
+                <button id="g-reset" type="button" title="Discard saved edits, restore the authored gestures">Reset</button>
+            </div>
+        </div>
+        <div id="gesture-cards"></div>
     </details>
 
     <!-- The p5 canvas mounts here (sketch.js → createCanvas().parent('stage')),

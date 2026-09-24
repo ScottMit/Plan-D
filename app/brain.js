@@ -8,7 +8,7 @@
 // student's own key from the page's Key field (getKey, saved per-browser),
 // parses the structured JSON, and returns:
 //
-//   { speech, gesture, intensity, gaze }   // gaze optional { yaw, pitch }
+//   { speech, gesture, scale, speed, gaze }   // scale ~0.3–1.5, speed ~0.5–2.0; gaze optional { yaw, pitch }
 //
 // On any failure (network, non-OK, bad JSON, an out-of-vocab gesture) it logs
 // and returns a SAFE fallback directive — never throws, never an unknown move.
@@ -57,11 +57,17 @@ const Brain = (() => {
         task:    'For each thing the person says, reply in character with ONE or TWO short '
                + 'sentences (spoken aloud, so keep it natural and brief). Choose exactly ONE '
                + 'gesture from the list below that best matches the feeling of your reply.',
-        rules:   'Also set intensity (0.0–1.0) for how big the movement is. Optionally add '
-               + 'gaze for a small expressive glance — use it to set the mood: pitch up (+) '
-               + 'when alert or delighted, down (−) when shy or sad; yaw a little to the side '
-               + 'when unsure or evasive. Keep both small (around ±0.3) and leave gaze out for '
-               + 'plain, direct attention. Never invent a gesture name that is not in the list.',
+        rules:   'Shape the movement with two levers. scale (about 0.3–1.5, 1.0 = as '
+               + 'authored) is how BIG the motion is — go bigger for strong feeling '
+               + '(excitement, emphasis, surprise), smaller for subtle, calm, or shy '
+               + 'replies. speed (about 0.5–2.0, 1.0 = normal) is how FAST it plays — quicker '
+               + 'for excited, urgent, or playful, slower for calm, tired, tender, or sad. '
+               + 'They combine: big + fast reads as very excited, small + slow as subdued or '
+               + 'weary; keep both near 1.0 for a plain, neutral reply. Optionally add gaze '
+               + 'for a small expressive glance — pitch up (+) when alert or delighted, down '
+               + '(−) when shy or sad; yaw a little to the side when unsure or evasive. Keep '
+               + 'gaze values small (around ±0.3) and leave gaze out for plain, direct '
+               + 'attention. Never invent a gesture name that is not in the list.',
     };
     function getPrompt() {
         let saved = {};
@@ -91,20 +97,28 @@ const Brain = (() => {
     }
 
     // The BehaviorDirective schema. gesture.enum = authored names (built fresh
-    // each call, so it always matches the current vocabulary).
+    // each call, so it always matches the current vocabulary). The `description`
+    // fields document each lever for the model AND for the on-screen Response
+    // schema panel — they ride with the enforced contract, so they hold even if
+    // the editable System prompt drifts.
     function responseSchema() {
         return {
             type: 'object',
             properties: {
-                speech:    { type: 'string' },
-                gesture:   { type: 'string', enum: Robot.gestureNames() },
-                intensity: { type: 'number' },
+                speech:    { type: 'string', description: 'what the robot says out loud — one or two short, natural sentences' },
+                gesture:   { type: 'string', enum: Robot.gestureNames(), description: 'the expressive move to play; must be one of the listed gestures' },
+                scale:     { type: 'number', description: 'amplitude 0.3–1.5 (1 = as authored): bigger for strong feeling, smaller for subtle or calm' },
+                speed:     { type: 'number', description: 'tempo 0.5–2.0 (1 = normal): faster for excited or urgent, slower for calm, tired, or sad' },
                 gaze: {
                     type: 'object',
-                    properties: { yaw: { type: 'number' }, pitch: { type: 'number' } },
+                    description: 'optional small glance to set the mood; leave out for plain, direct attention',
+                    properties: {
+                        yaw:   { type: 'number', description: 'turn left/right, about ±0.3' },
+                        pitch: { type: 'number', description: 'look up (+) or down (−), about ±0.3' },
+                    },
                 },
             },
-            required: ['speech', 'gesture', 'intensity'],
+            required: ['speech', 'gesture', 'scale', 'speed'],
         };
     }
 
@@ -127,7 +141,7 @@ const Brain = (() => {
     function fallbackDirective(speech, detail) {
         const names = Robot.gestureNames();
         const safe = names.includes('curious_tilt') ? 'curious_tilt' : (names[0] || Robot.REST_GESTURE);
-        return { speech: speech || "Hmm — I didn't quite catch that.", gesture: safe, intensity: 0.5, gaze: null, error: detail || null };
+        return { speech: speech || "Hmm — I didn't quite catch that.", gesture: safe, scale: 1.0, speed: 1.0, gaze: null, error: detail || null };
     }
 
     // Coerce/repair a parsed directive into something the robot can always play.
@@ -139,9 +153,12 @@ const Brain = (() => {
             console.warn('[brain] model returned an out-of-vocab gesture:', gesture, '→ using fallback gesture');
             gesture = names.includes('curious_tilt') ? 'curious_tilt' : (names[0] || Robot.REST_GESTURE);
         }
-        let intensity = Number(d.intensity);
-        if (!Number.isFinite(intensity)) intensity = 0.5;
-        intensity = Math.max(0, Math.min(1, intensity));
+        let scale = Number(d.scale);
+        if (!Number.isFinite(scale)) scale = 1.0;
+        scale = Math.max(0.2, Math.min(1.5, scale));
+        let speed = Number(d.speed);
+        if (!Number.isFinite(speed)) speed = 1.0;
+        speed = Math.max(0.5, Math.min(2.0, speed));
         let gaze = null;
         if (d.gaze && typeof d.gaze === 'object') {
             const yaw = Number(d.gaze.yaw), pitch = Number(d.gaze.pitch);
@@ -151,7 +168,7 @@ const Brain = (() => {
             };
         }
         const speech = (typeof d.speech === 'string' && d.speech.trim()) ? d.speech.trim() : '…';
-        return { speech, gesture, intensity, gaze };
+        return { speech, gesture, scale, speed, gaze };
     }
 
     // The main call. Returns a sanitised BehaviorDirective (never throws).
@@ -235,6 +252,6 @@ const Brain = (() => {
 
     return {
         askGeminiForGesture, getKey, setKey, supportsThinkingLevel,
-        getPrompt, setPromptPart, promptDefaults,
+        getPrompt, setPromptPart, promptDefaults, responseSchema,
     };
 })();
