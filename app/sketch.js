@@ -113,12 +113,21 @@ function wireControls() {
         keyField.addEventListener('input', () => Brain.setKey(keyField.value));
     }
 
-    // On a model change, grey out Thinking when the model can't use it (only
-    // Gemini 3 understands thinkingLevel — see Brain.supportsThinkingLevel).
-    bindSelect('sel-model', 'GEMINI_MODEL', updateThinkingAvailability);
+    // On a model change, update which model-dependent controls are available:
+    // Thinking (Gemini 3 only) and Camera (any Gemini; Gemma is text-only).
+    bindSelect('sel-model', 'GEMINI_MODEL', () => { updateThinkingAvailability(); updateCameraAvailability(); });
     bindSelect('sel-thinking', 'THINKING_LEVEL');
     bindSelect('sel-lang', 'SPEECH_LANG', (lang) => { if (recog) recog.lang = lang; });
     updateThinkingAvailability();   // set the initial enabled/greyed state
+
+    // Camera toggle → the robot's optional webcam "eyes" (camera.js). Always
+    // starts OFF (privacy); ticking it asks for camera permission.
+    const camToggle = el('cam-toggle');
+    if (camToggle) {
+        camToggle.checked = false;
+        camToggle.addEventListener('change', () => camToggle.checked ? Webcam.enable() : Webcam.disable());
+    }
+    updateCameraAvailability();   // greys the toggle if the current model can't see
 
     // Type box → the same turn the mic runs. Enter or Send both submit.
     typedInput = el('say');
@@ -461,6 +470,18 @@ function updateThinkingAvailability() {
     if (note) note.hidden = ok;
 }
 
+// Enable the Camera toggle only when the chosen model can accept an image (any
+// Gemini; Gemma is text-only). Otherwise grey it, show the note, and make sure
+// the webcam is actually off — brain.js would drop the frame anyway.
+function updateCameraAvailability() {
+    const box = document.getElementById('cam-toggle');
+    const note = document.getElementById('cam-note');
+    const ok = Brain.supportsVision(CONFIG.GEMINI_MODEL);
+    if (box) box.disabled = !ok;
+    if (note) note.hidden = ok;
+    if (!ok && Webcam.isRequested()) { Webcam.disable(); if (box) box.checked = false; }
+}
+
 // Route typed text through the same loop as a spoken utterance. Interrupts a
 // reply in progress (like barge-in, but without opening the mic).
 function submitTyped() {
@@ -484,6 +505,32 @@ function draw() {
     background(PAPER);
     drawFace();
     drawReadout();
+    drawCameraPreview();
+}
+
+// A small "what I see" thumbnail in the top-right when the webcam is on — so the
+// student can see exactly the frame the robot will send. The <video> itself is
+// hidden; we draw it here.
+function drawCameraPreview() {
+    if (!Webcam.isRequested()) return;
+    const pw = 128, ph = 96, px = W - pw - 20, py = 20;
+    push();
+    rectMode(CORNER);
+    noFill(); stroke(INK); strokeWeight(1.5);
+    rect(px - 1, py - 1, pw + 2, ph + 2);
+    if (Webcam.isLive()) {
+        // Draw the live video straight onto the p5 canvas 2D context — reliable
+        // for a <video> element (p5's image() can miss an off-screen one).
+        drawingContext.drawImage(Webcam.videoEl(), px, py, pw, ph);
+        noStroke(); fill(TEAL); circle(px + 7, py + ph + 12, 7);
+        fill(GREY); textAlign(LEFT, CENTER); textSize(11);
+        text('what I see', px + 17, py + ph + 12);
+    } else {
+        noStroke(); fill('#efece4'); rect(px, py, pw, ph);
+        fill(GREY); textAlign(CENTER, CENTER); textSize(11);
+        text('starting camera…', px + pw / 2, py + ph / 2);
+    }
+    pop();
 }
 
 // ---- state machine ---------------------------------------------------
@@ -571,6 +618,9 @@ function cancelListening() {
 async function runTurn(text, sttMs = null) {
     const myTurn = ++turnId;
     const tStart = performance.now();    // start the think timer
+    // Grab one webcam frame NOW (what the robot saw when you spoke), or null if
+    // the camera is off. It rides along to Gemini so the reply can react to it.
+    const image = Webcam.snapshot();
     setState(STATE.THINKING);
     setStatus('thinking…');
 
@@ -582,7 +632,7 @@ async function runTurn(text, sttMs = null) {
     startFaceGesture(Robot.FILLER_GESTURE, 1400);
     Robot.playGesture(Robot.FILLER_GESTURE, 0.5);
 
-    const directive = await Brain.askGeminiForGesture(text, history);
+    const directive = await Brain.askGeminiForGesture(text, history, image);
     if (myTurn !== turnId) return;       // a barge-in superseded this turn
 
     history.push({ role: 'model', text: directive.speech });

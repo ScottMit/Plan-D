@@ -87,6 +87,18 @@
                 <option value="en-AU">English — Australia</option>
             </select>
         </div>
+        <div class="row">
+            <span class="lbl">Camera</span>
+            <label class="check"><input type="checkbox" id="cam-toggle"> let the robot see (webcam)</label>
+            <!-- shown by sketch.js when the chosen model can't accept an image -->
+            <span id="cam-note" class="mut" hidden>Gemini models only — Gemma can't see</span>
+        </div>
+        <div class="row">
+            <span class="lbl"></span>
+            <span class="mut">Off by default. When on, <b>one still frame</b> is sent to Gemini with each
+                turn (Gemini 3 models only) so it can react to what it sees. Frames aren't stored, but they
+                do go to Google with your key — leave it off if you'd rather not share your camera.</span>
+        </div>
     </div>
 
     <!-- The response schema (read-only) — the exact JSON shape Gemini must return.
@@ -186,6 +198,7 @@
         'gestures.js',       // the authored gesture vocabulary (you edit this)
         'robot.js',          // Pardalote hardware adapter
         'brain.js',          // the Gemini call + response parsing
+        'camera.js',         // optional webcam "eyes" (opt-in)
         'sketch.js',         // p5 setup/draw, speech, the state machine
     ].forEach((src) => document.write(`<script src="${src}?v=${Date.now()}"><\/script>`));
 </script>

@@ -189,6 +189,9 @@ canvas {
 }
 #controls .row:last-child { margin-bottom: 0; }
 #controls select { min-width: 220px; }
+.check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-soft); cursor: pointer; }
+.check input { width: 15px; height: 15px; accent-color: var(--teal); cursor: pointer; }
+.check input:disabled { cursor: not-allowed; }
 .row input.grow { flex: 1; min-width: 220px; }
 .row .mut { font-size: 11.5px; color: var(--grey); line-height: 1.4; }
 .row .mut a { color: var(--teal); }

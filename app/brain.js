@@ -44,6 +44,20 @@ const Brain = (() => {
         return /^gemini-3[.-]/.test(m) || /-latest$/.test(m);
     }
 
+    // Which models can accept an image (the webcam frame). Every Gemini is
+    // multimodal; the Gemma open models are text-only, so we don't send a frame
+    // to them (it would just be ignored or error). Camera stays available; the
+    // frame is simply dropped for a text-only model.
+    function supportsVision(model) {
+        return /^gemini-/i.test(String(model || ''));
+    }
+
+    // Appended to the system instruction only on turns that carry a frame, so
+    // the model knows the image is live and uses it (especially for gaze).
+    const VISION_NOTE = 'A still photo of what you can see through your camera right now is attached to '
+        + 'this message. Use it: notice the person and their expression, and let it shape your reply and '
+        + 'your gaze. Don\'t describe the photo like a caption — react to it naturally, in character.';
+
     // --- the system prompt, in editable parts -------------------------
     // The instruction the model gets is three student-editable parts with the
     // AUTHORED gesture list inserted between them. Students rewrite the parts in
@@ -172,7 +186,9 @@ const Brain = (() => {
     }
 
     // The main call. Returns a sanitised BehaviorDirective (never throws).
-    async function askGeminiForGesture(userText, history) {
+    // imageB64 (optional) is a JPEG webcam frame (base64, no data: prefix) to
+    // send with this turn — the robot's "eyes". Ignored for text-only models.
+    async function askGeminiForGesture(userText, history, imageB64) {
         const key = getKey().trim();
         if (!key || key.includes('PASTE_')) {
             console.warn('[brain] no Gemini key — paste one into the Key field on the page.');
@@ -195,10 +211,20 @@ const Brain = (() => {
             generationConfig.thinkingConfig = { thinkingLevel: CONFIG.THINKING_LEVEL || 'low' };
         }
 
+        // The robot's "eyes": attach the webcam frame to THIS turn (not to the
+        // stored history, so we never resend old frames), and tell the model it
+        // can see. Only for multimodal models; dropped otherwise.
+        const useImage = imageB64 && supportsVision(CONFIG.GEMINI_MODEL);
+        const sysText = useImage ? systemInstruction() + '\n\n' + VISION_NOTE : systemInstruction();
+        const contents = toContents(history);
+        if (useImage && contents.length) {
+            contents[contents.length - 1].parts.push({ inlineData: { mimeType: 'image/jpeg', data: imageB64 } });
+        }
+
         const body = {
             model: CONFIG.GEMINI_MODEL,
-            systemInstruction: { parts: [{ text: systemInstruction() }] },
-            contents: toContents(history),
+            systemInstruction: { parts: [{ text: sysText }] },
+            contents,
             generationConfig,
         };
 
@@ -251,7 +277,7 @@ const Brain = (() => {
     }
 
     return {
-        askGeminiForGesture, getKey, setKey, supportsThinkingLevel,
+        askGeminiForGesture, getKey, setKey, supportsThinkingLevel, supportsVision,
         getPrompt, setPromptPart, promptDefaults, responseSchema,
     };
 })();
