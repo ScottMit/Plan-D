@@ -37,7 +37,7 @@ const CONFIG = {
 
     // Speech (Web Speech API — Chrome). (Also switchable live from the Voice
     // dropdown on the page.)
-    SPEECH_LANG: 'en-US',
+    SPEECH_LANG: 'en-AU',
 
     // --- Robot -------------------------------------------------------
     // false = on-canvas face only, no hardware (great for testing the loop).

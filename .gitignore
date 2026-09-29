@@ -15,3 +15,6 @@ config.js
 # Dependencies / environments
 node_modules/
 .venv/
+
+# Teaching docs — work in progress, not ready to distribute yet.
+docs/
