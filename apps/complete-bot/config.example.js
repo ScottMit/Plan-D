@@ -15,7 +15,7 @@
 // page instead (it's remembered in your browser, never in a file). Leaving this
 // blank is the normal, safest setup. A teacher running their own copy may
 // optionally pre-fill a key here; the page's field always wins if both are set.
-const GEMINI_KEY = '';
+const GEMINI_KEY = 'PASTE_YOUR_GEMINI_KEY';
 
 // The class's shared keyless relay URL (deployed from ../files — your teacher
 // provides this). The browser sends YOUR key in a header; quota is per-student.

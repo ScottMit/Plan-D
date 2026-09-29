@@ -1,0 +1,10 @@
+html, body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  padding-left: 16px;   /* breathing room on the left, so nothing sits flush to the edge */
+}
+canvas {
+  display: block;
+}
