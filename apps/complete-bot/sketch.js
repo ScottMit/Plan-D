@@ -132,6 +132,7 @@ function wireControls() {
     // Type box → the same turn the mic runs. Enter or Send both submit.
     typedInput = el('say');
     if (el('send')) el('send').addEventListener('click', submitTyped);
+    if (el('clear-history')) el('clear-history').addEventListener('click', clearHistory);
     if (typedInput) typedInput.addEventListener('keydown', (e) => {
         // Enter sends; Shift+Enter drops to a second line (it's a textarea now).
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.stopPropagation(); submitTyped(); }
@@ -914,6 +915,17 @@ async function runTurn(text, sttMs = null) {
 function trimHistory() {
     while (history.length > MAX_HISTORY) history.shift();
     while (history.length && history[0].role !== 'user') history.shift();
+}
+
+// Clear chat history — forget the conversation so far (the short memory sent with
+// each turn) and reset the on-screen readout, so the next message starts fresh.
+function clearHistory() {
+    history.length = 0;
+    lastUser = ''; lastReply = ''; lastGesture = '';
+    lastScale = 1; lastSpeed = 1;
+    lastError = ''; lastTiming = null;
+    readoutScroll = 0;
+    setStatus('chat history cleared — the robot starts fresh');
 }
 
 // ---- speaking (TTS) --------------------------------------------------

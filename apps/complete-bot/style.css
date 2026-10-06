@@ -376,4 +376,5 @@ canvas {
     border-radius: 0;
     resize: vertical;
 }
-#say-box button { align-self: flex-end; padding: 6px 20px; }   /* Send, under and to the right */
+.say-actions { display: flex; justify-content: flex-end; gap: 8px; }   /* Clear + Send, under and to the right */
+#say-box button { padding: 6px 20px; }
