@@ -2,24 +2,33 @@
 // config.example.js — copy this file to "config.js" and fill it in.
 //
 //   1. Copy this file to  config.js  (same folder).
-//   2. Set the class relay URL (PROXY_URL) below.
+//   2. Set the class relay subdomain (WORKERS_SUBDOMAIN) below.
 //   3. NEVER commit config.js and NEVER put it on a public web page.
 //      (config.js is already in .gitignore.)
+//
+// Your API KEY does NOT go in this file. You paste it into the "Key" field on the
+// page, where it's kept in your browser only — never in code. This file holds
+// only non-secret settings (the relay subdomain and the options below).
 //
 // config.js must load BEFORE gestures.js / robot.js / brain.js / sketch.js —
 // index.html already does that.
 // ==============================================================
 
-// --- Your Gemini key -------------------------------------------------
-// You DON'T need to put your key here — paste it into the "Key" field on the
-// page instead (it's remembered in your browser, never in a file). Leaving this
-// blank is the normal, safest setup. A teacher running their own copy may
-// optionally pre-fill a key here; the page's field always wins if both are set.
-const GEMINI_KEY = 'PASTE_YOUR_GEMINI_KEY';
+// Your Cloudflare workers.dev subdomain — the one-time, per-account name in your
+// relay URLs (https://<worker>.<THIS>.workers.dev). BOTH relay URLs below are
+// built from it, so set it in ONE place. Find it under Workers & Pages in the
+// Cloudflare dashboard, or in the URL that `wrangler deploy` prints.
+const WORKERS_SUBDOMAIN = 'YOUR-SUBDOMAIN';
 
-// The class's shared keyless relay URL (deployed from ../files — your teacher
-// provides this). The browser sends YOUR key in a header; quota is per-student.
-const PROXY_URL = 'https://gemini-relay.YOUR-SUBDOMAIN.workers.dev';
+// The class's shared KEYLESS relays (deployed from ../files/<name>). The browser
+// sends YOUR own key in a header and the relay forwards it, so quota is
+// per-student. Both workers live on the same subdomain; only the name differs.
+//   • Gemini — relays to Google.
+//   • Val    — Val sends no CORS headers, so the browser reaches it through this
+//              relay (forwards your own Val key). Only needed for the Val provider.
+// (Groq needs no relay — it's called directly with your Groq key.)
+const PROXY_URL     = `https://gemini-relay.${WORKERS_SUBDOMAIN}.workers.dev`;
+const VAL_PROXY_URL = `https://val-relay.${WORKERS_SUBDOMAIN}.workers.dev`;
 
 // --- Everything else lives on CONFIG ----------------------------------
 const CONFIG = {

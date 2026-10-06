@@ -1,62 +1,320 @@
 // ==============================================================
-// brain.js — the LLM turn: user text -> a BehaviorDirective.
+// brain.js — the LLM turn: user text -> a behaviour directive.
 //
-// askGeminiForGesture(userText, history) builds a JSON schema whose `gesture`
-// enum is the robot's AUTHORED gesture names (from Robot.gestureCatalogue()),
-// so the model can only ever pick a gesture that exists. It calls Gemini's
-// generateContent through the keyless relay (PROXY_URL from config.js) using the
-// student's own key from the page's Key field (getKey, saved per-browser),
-// parses the structured JSON, and returns:
+// askForDirective(userText, history, imageB64) assembles the system instruction
+// (editable persona/task/rules + the authored gesture list) and the response
+// schema (responseSchema), then hands them to the ACTIVE PROVIDER, which knows
+// how to talk to one LLM service: where to send the request, how to authenticate,
+// how to shape the request body, and how to read the reply. It parses the
+// structured JSON and returns a directive object (whatever the schema defines —
+// by default { speech, gesture, scale, speed, gaze }).
 //
-//   { speech, gesture, scale, speed, gaze }   // scale ~0.3–1.5, speed ~0.5–2.0; gaze optional { yaw, pitch }
+// On any failure (no key, network, non-OK, bad JSON) it logs and returns a SAFE
+// fallback directive — never throws.
 //
-// On any failure (network, non-OK, bad JSON, an out-of-vocab gesture) it logs
-// and returns a SAFE fallback directive — never throws, never an unknown move.
+// --- Adding another LLM (Grok, RMIT Val, …) ----------------------------
+// Only the PROVIDER differs between services; the turn loop below is neutral.
+// To add one, write another provider object with the same shape as
+// GeminiProvider (endpoint / headers / buildBody / extractText / errorMessage +
+// the capability predicates), register it in PROVIDERS, and point the app at it
+// (CONFIG.LLM_PROVIDER). This build ships Gemini only.
 //
 // Why generateContent (not the Interactions API): the Interactions client adds
-// an Api-Revision header that triggers a CORS preflight the Gemini host
-// rejects, so it can't be called from a browser. generateContent has no such
-// problem and is what the relay forwards.
+// an Api-Revision header that triggers a CORS preflight the Gemini host rejects,
+// so it can't be called from a browser. generateContent has no such problem and
+// is what the relay forwards.
 // ==============================================================
 
 const Brain = (() => {
 
-    // --- the student's API key ----------------------------------------
+    // --- the student's API key (per provider) -------------------------
     // The key lives in the page's Key field, remembered in THIS browser only
-    // (localStorage) — never in a committed file. getKey() falls back to a
-    // GEMINI_KEY in config.js if one is set (handy for the teacher's own copy),
-    // so nothing breaks if the field is left blank but config has a key.
-    const KEY_STORE = 'plan-d-gemini-key';
+    // (localStorage) — never in a file. Each provider keeps its OWN key (Gemini /
+    // Groq / Val use different keys), so switching provider swaps the field. Gemini
+    // also reads the legacy single-key store, so a key saved by an earlier version
+    // still works.
+    const keyStoreFor = (id) => 'plan-d-key-' + id;
     function getKey() {
-        try { const k = localStorage.getItem(KEY_STORE); if (k) return k; } catch (e) {}
-        return (typeof GEMINI_KEY === 'string' ? GEMINI_KEY : '');
+        const id = getProviderId();
+        try { const k = localStorage.getItem(keyStoreFor(id)); if (k) return k; } catch (e) {}
+        if (id === 'gemini') {
+            try { const legacy = localStorage.getItem('plan-d-gemini-key'); if (legacy) return legacy; } catch (e) {}
+        }
+        return '';
     }
     function setKey(v) {
-        try { localStorage.setItem(KEY_STORE, (v || '').trim()); } catch (e) {}
+        try { localStorage.setItem(keyStoreFor(getProviderId()), (v || '').trim()); } catch (e) {}
     }
 
-    // thinkingLevel is a GEMINI 3 feature. Gemini 2.5 used a different, numeric
-    // setting (thinkingBudget) and Gemma has no thinking at all — sending
-    // thinkingLevel to those is an unknown field (a 400). Match gemini-3.x /
-    // gemini-3-… and the "-latest" aliases (which currently resolve to Gemini 3).
-    function supportsThinkingLevel(model) {
-        const m = String(model || '');
-        return /^gemini-3[.-]/.test(m) || /-latest$/.test(m);
-    }
-
-    // Which models can accept an image (the webcam frame). Every Gemini is
-    // multimodal; the Gemma open models are text-only, so we don't send a frame
-    // to them (it would just be ignored or error). Camera stays available; the
-    // frame is simply dropped for a text-only model.
-    function supportsVision(model) {
-        return /^gemini-/i.test(String(model || ''));
-    }
-
-    // Appended to the system instruction only on turns that carry a frame, so
-    // the model knows the image is live and uses it (especially for gaze).
+    // Appended to the system instruction only on turns that carry a frame, so the
+    // model knows the image is live and uses it (especially for gaze). Generic
+    // prose — the PROVIDER decides how the image itself rides along.
     const VISION_NOTE = 'A still photo of what you can see through your camera right now is attached to '
         + 'this message. Use it: notice the person and their expression, and let it shape your reply and '
         + 'your gaze. Don\'t describe the photo like a caption — react to it naturally, in character.';
+
+    // ===============================================================
+    // PROVIDERS — one object per LLM service. The turn loop calls only this
+    // interface, so every service-specific detail (URL, auth, body shape, reply
+    // shape, model capabilities) lives here. Each provider implements:
+    //   supportsThinkingLevel(model) · supportsVision(model)   — model capabilities
+    //   endpoint() · endpointReady() · headers(key)            — where + auth
+    //   buildBody({ model, systemText, history, imageB64, schema, thinking })
+    //   extractText(data) · errorMessage(data)                 — read the reply
+    // ===============================================================
+
+    // Google Gemini via generateContent, through the keyless class relay
+    // (PROXY_URL from config.js), carrying the student's own key in a header.
+    const GeminiProvider = {
+        id: 'gemini',
+        label: 'Google Gemini',
+
+        // Where students get a key, and what the Key field should look like.
+        keyHint: { placeholder: 'paste your own Gemini API key', text: 'Get one free at', link: 'aistudio.google.com/apikey', url: 'https://aistudio.google.com/apikey' },
+
+        // The model menu (grouped). Model availability changes often — refresh
+        // from https://ai.google.dev/gemini-api/docs/models. Some are here to
+        // FAIL on purpose (e.g. gemini-2.5-flash is retired for new keys → 404).
+        models() {
+            return [
+                { label: 'Gemini 3 — current', options: [
+                    { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+                    { value: 'gemini-3.7-flash', label: 'gemini-3.7-flash' },
+                    { value: 'gemini-3.6-flash', label: 'gemini-3.6-flash (default)' },
+                    { value: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
+                    { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
+                    { value: 'gemini-3.1-flash-lite', label: 'gemini-3.1-flash-lite' },
+                    { value: 'gemini-3.1-pro-preview', label: 'gemini-3.1-pro-preview' },
+                    { value: 'gemini-3-flash-preview', label: 'gemini-3-flash-preview' },
+                ] },
+                { label: 'Aliases — always point at a current model', options: [
+                    { value: 'gemini-flash-latest', label: 'gemini-flash-latest' },
+                    { value: 'gemini-flash-lite-latest', label: 'gemini-flash-lite-latest' },
+                    { value: 'gemini-pro-latest', label: 'gemini-pro-latest' },
+                ] },
+                { label: 'Gemini 2.5 — older (may error)', options: [
+                    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+                    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+                    { value: 'gemini-2.5-flash-lite', label: 'gemini-2.5-flash-lite' },
+                ] },
+                { label: 'Gemma — open models (structured output may differ)', options: [
+                    { value: 'gemma-4-31b-it', label: 'gemma-4-31b-it' },
+                    { value: 'gemma-4-26b-a4b-it', label: 'gemma-4-26b-a4b-it' },
+                ] },
+            ];
+        },
+        defaultModel() { return (typeof CONFIG !== 'undefined' && CONFIG.GEMINI_MODEL) || 'gemini-3.6-flash'; },
+
+        // thinkingLevel is a GEMINI 3 feature. Gemini 2.5 used a different, numeric
+        // setting (thinkingBudget) and Gemma has none — sending thinkingLevel to
+        // those is an unknown field (a 400). Match gemini-3.x / gemini-3-… and the
+        // "-latest" aliases (which currently resolve to Gemini 3).
+        supportsThinkingLevel(model) {
+            const m = String(model || '');
+            return /^gemini-3[.-]/.test(m) || /-latest$/.test(m);
+        },
+        // Every Gemini is multimodal; the Gemma open models are text-only, so a
+        // frame is dropped for them (it would just be ignored or error).
+        supportsVision(model) { return /^gemini-/i.test(String(model || '')); },
+
+        endpoint() { return (typeof PROXY_URL === 'string') ? PROXY_URL : ''; },
+        endpointReady() { const u = this.endpoint(); return !!u && !u.includes('YOUR-SUBDOMAIN'); },
+        headers(key) { return { 'Content-Type': 'application/json', 'x-goog-api-key': key }; },
+
+        // Our rolling history → Gemini `contents`. Roles are 'user'|'model';
+        // Gemini requires the first entry to be 'user', so trim any leading model
+        // turns (can happen after a fallback with no preceding user turn).
+        _toContents(history) {
+            const c = (history || []).map((h) => ({
+                role: h.role === 'model' ? 'model' : 'user',
+                parts: [{ text: String(h.text || '') }],
+            }));
+            while (c.length && c[0].role !== 'user') c.shift();
+            return c;
+        },
+
+        // Build the generateContent request body from the neutral spec. The webcam
+        // frame (if any — already gated by supportsVision) rides on the LAST user
+        // turn as inlineData, so we never resend old frames.
+        buildBody({ model, systemText, history, imageB64, schema, thinking }) {
+            const generationConfig = { responseMimeType: 'application/json', responseSchema: schema };
+            if (thinking) generationConfig.thinkingConfig = { thinkingLevel: thinking };
+            const contents = this._toContents(history);
+            if (imageB64 && contents.length) {
+                contents[contents.length - 1].parts.push({ inlineData: { mimeType: 'image/jpeg', data: imageB64 } });
+            }
+            return { model, systemInstruction: { parts: [{ text: systemText }] }, contents, generationConfig };
+        },
+
+        // The structured-output JSON text out of a successful response.
+        extractText(data) { return data && data.candidates && data.candidates[0]
+            && data.candidates[0].content && data.candidates[0].content.parts
+            && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text; },
+        // A human-readable reason for a non-OK response.
+        errorMessage(data) { return (data && data.error && data.error.message) || 'request failed'; },
+    };
+
+    // --- OpenAI-compatible chat services (Groq, Val) ------------------
+    // Groq and Val both speak the OpenAI /chat/completions dialect, so they share
+    // this one base; `cfg` supplies the per-service differences (endpoint, model
+    // list, how structured output is requested, vision/reasoning support). Gemini
+    // keeps its own object above because its wire format is different.
+    //   cfg: { id, label, endpoint(), models, defaultModel,
+    //          structured: 'json_schema' | 'json_object',
+    //          vision: bool, reasoning: bool, reasoningEffort(level)->str,
+    //          stripReasoning: bool }
+    function openAiChat(cfg) {
+        // Our rolling history → OpenAI `messages` (system first; roles user|assistant).
+        // A webcam frame (already gated by supportsVision) attaches to the last user
+        // turn as an OpenAI content-array image_url (data: URI).
+        function messagesFrom(systemText, history, imageB64) {
+            const msgs = [{ role: 'system', content: systemText }];
+            const turns = (history || []).map((h) => ({
+                role: h.role === 'model' ? 'assistant' : 'user',
+                content: String(h.text || ''),
+            }));
+            if (imageB64) {
+                for (let i = turns.length - 1; i >= 0; i--) {
+                    if (turns[i].role === 'user') {
+                        turns[i] = { role: 'user', content: [
+                            { type: 'text', text: turns[i].content },
+                            { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + imageB64 } },
+                        ] };
+                        break;
+                    }
+                }
+            }
+            return msgs.concat(turns);
+        }
+
+        return {
+            id: cfg.id,
+            label: cfg.label,
+            keyHint: cfg.keyHint,
+
+            supportsThinkingLevel(model) { return cfg.reasoning ? (cfg.supportsThinkingLevel ? cfg.supportsThinkingLevel(model) : true) : false; },
+            supportsVision() { return !!cfg.vision; },
+
+            endpoint() { return cfg.endpoint(); },
+            endpointReady() { const u = cfg.endpoint(); return !!u && !/YOUR-SUBDOMAIN|PASTE_/.test(u); },
+            headers(key) { return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` }; },
+
+            models() { return cfg.models; },
+            defaultModel() { return cfg.defaultModel; },
+
+            buildBody({ model, systemText, history, imageB64, schema, thinking }) {
+                let sysText = systemText, responseFormat;
+                if (cfg.structured === 'json_schema') {
+                    // Val: the service enforces the schema (OpenAI structured outputs).
+                    responseFormat = { type: 'json_schema', json_schema: { name: 'behaviour_directive', schema } };
+                } else {
+                    // Groq: reasoning models don't honour a strict schema reliably, so
+                    // ask for a JSON object and embed the schema in the instruction.
+                    sysText = systemText + '\n\nReturn ONLY a JSON object matching this schema — no prose, no code fences:\n' + JSON.stringify(schema);
+                    responseFormat = { type: 'json_object' };
+                }
+                const body = {
+                    model,
+                    messages: messagesFrom(sysText, history, imageB64),
+                    response_format: responseFormat,
+                    max_tokens: cfg.maxTokens || 1024,
+                    temperature: cfg.temperature != null ? cfg.temperature : 0.8,
+                };
+                // Reasoning control (e.g. Groq gpt-oss): map our thinking level →
+                // reasoning_effort, and drop the reasoning text from the reply.
+                if (thinking && cfg.reasoning) {
+                    body.reasoning_effort = cfg.reasoningEffort ? cfg.reasoningEffort(thinking) : thinking;
+                    body.include_reasoning = false;
+                }
+                return body;
+            },
+
+            // Pull the assistant message out, and — for reasoning models — strip any
+            // <think>…</think> and code fences, then isolate the first { … } object.
+            extractText(data) {
+                let t = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+                t = String(t || '');
+                if (cfg.stripReasoning) {
+                    t = t.replace(/^[\s\S]*?<\/think>/i, '')        // up to the first </think>
+                         .replace(/<think>[\s\S]*?<\/think>/gi, '') // any remaining closed blocks
+                         .replace(/<think>[\s\S]*$/i, '')           // a trailing unclosed block
+                         .replace(/```(?:json)?/gi, '')             // code fences
+                         .trim();
+                    const m = t.match(/\{[\s\S]*\}/);               // the first JSON object
+                    if (m) t = m[0];
+                }
+                return t;
+            },
+            errorMessage(data) { return (data && data.error && data.error.message) || 'request failed'; },
+        };
+    }
+
+    // Groq — OpenAI-compatible, called DIRECT (Groq allows browser CORS). The
+    // listed models are text-only reasoning models (gpt-oss / qwen), so vision is
+    // off and we strip their <think> reasoning before parsing.
+    const GroqProvider = openAiChat({
+        id: 'groq', label: 'Groq',
+        keyHint: { placeholder: 'gsk_…', text: 'Get one at', link: 'console.groq.com/keys', url: 'https://console.groq.com/keys' },
+        endpoint: () => 'https://api.groq.com/openai/v1/chat/completions',
+        structured: 'json_object',
+        vision: false,
+        reasoning: true,
+        stripReasoning: true,
+        supportsThinkingLevel: (m) => /gpt-oss/i.test(String(m || '')),
+        reasoningEffort: (lvl) => (lvl === 'minimal' ? 'low' : lvl),
+        models: [{ label: 'Groq', options: [
+            { value: 'openai/gpt-oss-120b', label: 'gpt-oss-120b · OpenAI (best)' },
+            { value: 'openai/gpt-oss-20b',  label: 'gpt-oss-20b · OpenAI (fastest)' },
+            { value: 'qwen/qwen3.6-27b',    label: 'qwen3.6-27b · Alibaba (reasoning)' },
+        ] }],
+        defaultModel: 'openai/gpt-oss-120b',
+    });
+
+    // RMIT Val — OpenAI-compatible, but Val sends NO CORS headers (Terms §8.1), so
+    // it's reached through the KEYLESS val-relay (VAL_PROXY_URL from config.js),
+    // which forwards the student's own key. Val enforces a real json_schema and is
+    // multimodal (val-gpt-4o); clean output, so no reasoning-stripping.
+    const ValProvider = openAiChat({
+        id: 'val', label: 'RMIT Val',
+        keyHint: { placeholder: 'sk-… (from your Val dashboard)', text: 'Generate one in your Val dashboard —', link: 'val-npe.rmit.edu.au', url: 'https://val-npe.rmit.edu.au/' },
+        endpoint: () => (typeof VAL_PROXY_URL === 'string' ? VAL_PROXY_URL : ''),
+        structured: 'json_schema',
+        vision: true,
+        reasoning: false,
+        models: [{ label: 'Val', options: [
+            { value: 'val-gpt-4o', label: 'val-gpt-4o (GPT-4o)' },
+        ] }],
+        defaultModel: 'val-gpt-4o',
+    });
+
+    // The registry, in menu order.
+    const PROVIDERS = { gemini: GeminiProvider, groq: GroqProvider, val: ValProvider };
+    function providers() { return Object.keys(PROVIDERS).map((id) => ({ id, label: PROVIDERS[id].label })); }
+
+    // Which provider is selected — saved in this browser (the page's Provider
+    // dropdown sets it). Falls back to CONFIG.LLM_PROVIDER, then Gemini.
+    const PROVIDER_STORE = 'plan-d-provider';
+    function getProviderId() {
+        try { const id = localStorage.getItem(PROVIDER_STORE); if (id && PROVIDERS[id]) return id; } catch (e) {}
+        const c = (typeof CONFIG !== 'undefined' && CONFIG.LLM_PROVIDER) || '';
+        return PROVIDERS[c] ? c : 'gemini';
+    }
+    function setProviderId(id) { if (PROVIDERS[id]) { try { localStorage.setItem(PROVIDER_STORE, id); } catch (e) {} } }
+    function activeProvider() { return PROVIDERS[getProviderId()] || GeminiProvider; }
+    function providerModels() { const p = activeProvider(); return p.models ? p.models() : []; }
+    function providerKeyHint() { return activeProvider().keyHint || {}; }
+
+    // The chosen MODEL is remembered PER PROVIDER, so switching back and forth
+    // keeps each service on its own last model. Defaults to the provider's default.
+    function getModel() {
+        const p = activeProvider();
+        try { const m = localStorage.getItem('plan-d-model-' + p.id); if (m) return m; } catch (e) {}
+        return (p.defaultModel ? p.defaultModel() : '') || '';
+    }
+    function setModel(m) {
+        try { localStorage.setItem('plan-d-model-' + getProviderId(), String(m)); } catch (e) {}
+    }
+    function activeModel() { return getModel(); }
 
     // --- the system prompt, in editable parts -------------------------
     // The instruction the model gets is three student-editable parts with the
@@ -110,11 +368,13 @@ const Brain = (() => {
         ].join('\n');
     }
 
-    // The BehaviorDirective schema. gesture.enum = authored names (built fresh
-    // each call, so it always matches the current vocabulary). The `description`
-    // fields document each lever for the model AND for the on-screen Response
-    // schema panel — they ride with the enforced contract, so they hold even if
-    // the editable System prompt drifts.
+    // --- the response schema (defined here in the code) ---------------
+    // responseSchema() is the structured-output shape the model MUST return. The
+    // API enforces it, so the chosen gesture is always a real one (enum = authored
+    // names, built fresh each call) and the levers are always present. EDIT THIS
+    // IN THE CODE to change what the robot returns: add a field here, then give it
+    // an effect by adding a handler of the same name in actions.js. The Response
+    // Schema panel shows this read-only, so students can see the exact contract.
     function responseSchema() {
         return {
             type: 'object',
@@ -136,18 +396,6 @@ const Brain = (() => {
         };
     }
 
-    // Turn our rolling history into Gemini `contents`. Roles are 'user'|'model';
-    // Gemini requires the first entry to be 'user', so trim any leading model
-    // turns (can happen after a fallback that had no preceding user turn).
-    function toContents(history) {
-        const contents = history.map((h) => ({
-            role: h.role === 'model' ? 'model' : 'user',
-            parts: [{ text: String(h.text || '') }],
-        }));
-        while (contents.length && contents[0].role !== 'user') contents.shift();
-        return contents;
-    }
-
     // A safe directive when the model can't be reached or parsed. Prefers a
     // gentle, unmistakably-fine gesture from whatever the student authored.
     // `detail` (optional) is a short, human-readable reason the sketch shows on
@@ -158,107 +406,84 @@ const Brain = (() => {
         return { speech: speech || "Hmm — I didn't quite catch that.", gesture: safe, scale: 1.0, speed: 1.0, gaze: null, error: detail || null };
     }
 
-    // Coerce/repair a parsed directive into something the robot can always play.
+    // The model returns JSON shaped by the ACTIVE schema, which students can edit
+    // in the code — so we no longer force the old {speech,gesture,scale,speed,gaze}
+    // shape here. We pass the parsed object through almost untouched and let the
+    // layers that use it stay safe on their own: actions.js decides what each field
+    // means, and robot.js clamps scale/speed/gaze and falls back to a real gesture
+    // if the name doesn't exist. The only guarantee made here is "it's an object".
     function sanitise(d) {
-        if (!d || typeof d !== 'object') return fallbackDirective();
-        const names = Robot.gestureNames();
-        let gesture = typeof d.gesture === 'string' ? d.gesture : '';
-        if (!names.includes(gesture)) {
-            console.warn('[brain] model returned an out-of-vocab gesture:', gesture, '→ using fallback gesture');
-            gesture = names.includes('curious_tilt') ? 'curious_tilt' : (names[0] || Robot.REST_GESTURE);
-        }
-        let scale = Number(d.scale);
-        if (!Number.isFinite(scale)) scale = 1.0;
-        scale = Math.max(0.2, Math.min(1.5, scale));
-        let speed = Number(d.speed);
-        if (!Number.isFinite(speed)) speed = 1.0;
-        speed = Math.max(0.5, Math.min(2.0, speed));
-        let gaze = null;
-        if (d.gaze && typeof d.gaze === 'object') {
-            const yaw = Number(d.gaze.yaw), pitch = Number(d.gaze.pitch);
-            gaze = {
-                yaw:   Number.isFinite(yaw)   ? Math.max(-1, Math.min(1, yaw))   : 0,
-                pitch: Number.isFinite(pitch) ? Math.max(-1, Math.min(1, pitch)) : 0,
-            };
-        }
-        const speech = (typeof d.speech === 'string' && d.speech.trim()) ? d.speech.trim() : '…';
-        return { speech, gesture, scale, speed, gaze };
+        if (!d || typeof d !== 'object' || Array.isArray(d)) return fallbackDirective();
+        return d;
     }
 
-    // The main call. Returns a sanitised BehaviorDirective (never throws).
-    // imageB64 (optional) is a JPEG webcam frame (base64, no data: prefix) to
-    // send with this turn — the robot's "eyes". Ignored for text-only models.
-    async function askGeminiForGesture(userText, history, imageB64) {
+    // Attach round-trip timing (ms) to a directive for the on-screen timer.
+    function withTiming(directive, networkMs, parseMs) {
+        directive.timing = { network: networkMs, parse: parseMs };
+        return directive;
+    }
+
+    // The main call. Returns a directive (never throws). Provider-neutral: it
+    // gathers the neutral request spec and lets the active provider shape the
+    // request and read the reply. imageB64 (optional) is a JPEG webcam frame
+    // (base64, no data: prefix) — the robot's "eyes"; dropped for text-only models.
+    async function askForDirective(userText, history, imageB64) {
+        const provider = activeProvider();
+        const model = activeModel();
+
         const key = getKey().trim();
-        if (!key || key.includes('PASTE_')) {
-            console.warn('[brain] no Gemini key — paste one into the Key field on the page.');
-            return fallbackDirective('I need a Gemini key before I can really chat.',
-                'no Gemini key yet — paste yours into the Key field above the face');
+        if (!key) {
+            console.warn('[brain] no API key — paste one into the Key field on the page.');
+            return fallbackDirective('I need a key before I can really chat.',
+                'no key yet — paste yours into the Key field above the face');
         }
-        if (!PROXY_URL || PROXY_URL.includes('YOUR-SUBDOMAIN')) {
-            console.warn('[brain] PROXY_URL not set in config.js — using fallback.');
+        if (!provider.endpointReady()) {
+            console.warn('[brain] relay endpoint not set in config.js — using fallback.');
             return fallbackDirective("My relay isn't set up yet.",
-                'PROXY_URL not set in config.js (the class relay URL)');
+                `the ${provider.label} relay URL isn't set in config.js`);
         }
 
-        const generationConfig = {
-            responseMimeType: 'application/json',
-            responseSchema: responseSchema(),
-        };
-        // Add the Gemini 3 thinking control only for models that understand it
-        // (see supportsThinkingLevel). 'low' minimises latency for this quick loop.
-        if (supportsThinkingLevel(CONFIG.GEMINI_MODEL)) {
-            generationConfig.thinkingConfig = { thinkingLevel: CONFIG.THINKING_LEVEL || 'low' };
-        }
+        // Gate the model-dependent extras with the provider's own capabilities,
+        // then hand the provider a neutral spec to shape into its request body.
+        const useImage = !!imageB64 && provider.supportsVision(model);
+        const systemText = useImage ? systemInstruction() + '\n\n' + VISION_NOTE : systemInstruction();
+        const thinking = provider.supportsThinkingLevel(model) ? (CONFIG.THINKING_LEVEL || 'low') : null;
+        const body = provider.buildBody({
+            model, systemText, history,
+            imageB64: useImage ? imageB64 : null,
+            schema: responseSchema(),
+            thinking,
+        });
 
-        // The robot's "eyes": attach the webcam frame to THIS turn (not to the
-        // stored history, so we never resend old frames), and tell the model it
-        // can see. Only for multimodal models; dropped otherwise.
-        const useImage = imageB64 && supportsVision(CONFIG.GEMINI_MODEL);
-        const sysText = useImage ? systemInstruction() + '\n\n' + VISION_NOTE : systemInstruction();
-        const contents = toContents(history);
-        if (useImage && contents.length) {
-            contents[contents.length - 1].parts.push({ inlineData: { mimeType: 'image/jpeg', data: imageB64 } });
-        }
-
-        const body = {
-            model: CONFIG.GEMINI_MODEL,
-            systemInstruction: { parts: [{ text: sysText }] },
-            contents,
-            generationConfig,
-        };
-
-        // Time the round trip: `network` covers request → relay → Google →
-        // reply fully read back (the whole trip, dominated by the model itself);
-        // `parse` is turning that reply into a directive (tiny — the lesson is
-        // that the wait is the model, not our code). Attached to what we return.
+        // Time the round trip: `network` covers request → relay → service → reply
+        // fully read back (dominated by the model itself); `parse` is turning that
+        // reply into a directive (tiny — the lesson is the wait is the model, not us).
         let res, data;
         const tNet0 = performance.now();
         try {
-            res = await fetch(PROXY_URL, {
+            res = await fetch(provider.endpoint(), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+                headers: provider.headers(key),
                 body: JSON.stringify(body),
             });
             data = await res.json();
         } catch (e) {
             console.error('[brain] network error reaching the relay:', e);
-            return fallbackDirective("I can't reach my brain right now.", 'network error reaching the relay (PROXY_URL)');
+            return fallbackDirective("I can't reach my brain right now.", 'network error reaching the relay');
         }
         const networkMs = performance.now() - tNet0;
 
         if (!res.ok) {
-            // Surface the real reason (e.g. a 404 "model no longer available", a
-            // 400 bad request, a 429 quota) instead of failing silently. The
-            // model name is included because a wrong/retired model is the usual
-            // cause — exactly what the on-screen error line should reveal.
-            const msg = data?.error?.message || 'request failed';
-            console.error('[brain] Gemini error', res.status, data);
+            // Surface the real reason (a 404 "model no longer available", a 400 bad
+            // request, a 429 quota…) instead of failing silently — the model name is
+            // included because a wrong/retired model is the usual cause.
+            const msg = provider.errorMessage(data);
+            console.error(`[brain] ${provider.id} error`, res.status, data);
             return withTiming(fallbackDirective("Something went wrong when I tried to think.",
-                `Gemini ${res.status} on "${CONFIG.GEMINI_MODEL}": ${msg}`), networkMs, 0);
+                `${provider.label} ${res.status} on "${model}": ${msg}`), networkMs, 0);
         }
 
-        const jsonText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        const jsonText = provider.extractText(data);
         try {
             const tParse0 = performance.now();
             const directive = sanitise(JSON.parse(jsonText));
@@ -270,14 +495,16 @@ const Brain = (() => {
         }
     }
 
-    // Attach round-trip timing (ms) to a directive for the on-screen timer.
-    function withTiming(directive, networkMs, parseMs) {
-        directive.timing = { network: networkMs, parse: parseMs };
-        return directive;
-    }
+    // Capability predicates the page uses to grey out model-dependent controls
+    // (Thinking, Camera) — delegated to the active provider so they always match
+    // what the request will actually send.
+    function supportsThinkingLevel(model) { return activeProvider().supportsThinkingLevel(model); }
+    function supportsVision(model) { return activeProvider().supportsVision(model); }
 
     return {
-        askGeminiForGesture, getKey, setKey, supportsThinkingLevel, supportsVision,
+        askForDirective, getKey, setKey, supportsThinkingLevel, supportsVision,
         getPrompt, setPromptPart, promptDefaults, responseSchema,
+        providers, getProviderId, setProviderId, providerModels, providerKeyHint,
+        getModel, setModel,
     };
 })();

@@ -1,0 +1,17 @@
+# wrangler.toml — configuration for the keyless Val relay.
+# Rename "val-relay" if you like; the name becomes part of your public URL:
+#   https://<name>.<your-subdomain>.workers.dev
+
+name = "val-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# No secrets — this relay stores NO key. Each student sends their own Val key in
+# the Authorization header and the worker forwards it.
+#
+# VAL_API_BASE is just the public Val endpoint to forward to. The class uses the
+# non-production environment (NPE), where students generate their keys:
+#   NPE   https://val-npe.rmit.edu.au/api/chat/completions   (dashboard: https://val-npe.rmit.edu.au/)
+#   prod  https://val.rmit.edu.au/api/chat/completions
+[vars]
+VAL_API_BASE = "https://val-npe.rmit.edu.au/api/chat/completions"

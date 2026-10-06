@@ -22,6 +22,10 @@ const INK = '#2B2420', GREY = '#6d6a5f', HAIR = '#d9d2c2', PAPER = '#faf8f2',
 
 const W = 640, H = 600;
 
+// On-canvas readout geometry: a SCROLLABLE YOU/ROBOT text region (top..bottom),
+// with the gesture + timing lines pinned below it near the canvas bottom.
+const READOUT = { x: 28, top: 372, bottom: H - 72, w: W - 56 };
+
 // ---- state -----------------------------------------------------------
 const STATE = { IDLE: 'idle', LISTENING: 'listening', THINKING: 'thinking', SPEAKING: 'speaking' };
 let state = STATE.IDLE;
@@ -44,6 +48,9 @@ let lastSpeed = 1;
 let lastError = '';            // last API/parse failure reason (shown in red)
 let lastTiming = null;         // { think, speak, total, network, parse } in ms
 let statusLine = 'idle — press SPACE to talk';
+
+let readoutScroll = 0;         // px scrolled in the YOU/ROBOT text region
+let readoutMax = 0;            // max scroll (content height − region height); 0 = no overflow
 
 // on-canvas face gesture envelope
 let gestureAnim = null;        // { name, start, duration, peak }
@@ -76,13 +83,16 @@ function setup() {
     textFont('system-ui');
 
     loadGestures();                       // overlay any saved gesture edits before anything reads them
-    Robot.setup(CONFIG.USE_ROBOT, setStatus);
+    Robot.setup(setStatus);               // face-only until the Robot checkbox opts in
     initSpeech();
     wireControls();
+    wireRobotPanel();                     // the "use a physical robot" checkbox + connection reveal
+    wireActuatorPanel();                  // the add/remove actuator list (type + pins)
     wireGesturePanel();
-    renderSchema();
+    renderSchema();                       // the read-only Response Schema view
 
     setState(STATE.IDLE);
+    if (speechSupported) setStatus('idle — press SPACE to talk, or type below');
 }
 
 // Connect the settings UI (the <select>s + Type box, all defined in index.html)
@@ -104,21 +114,11 @@ function wireControls() {
         sel.addEventListener('change', apply);
     };
 
-    // Key field → the student's own Gemini key, saved in this browser only.
-    // Seeds from whatever's saved (Brain.getKey), and stores every keystroke so
-    // the next turn — and the next reload — uses it. Nothing is written to a file.
-    const keyField = el('gemini-key');
-    if (keyField) {
-        keyField.value = Brain.getKey();
-        keyField.addEventListener('input', () => Brain.setKey(keyField.value));
-    }
+    // Provider + Model + Key are linked, so they're wired together (see below).
+    wireProviderControls(el);
 
-    // On a model change, update which model-dependent controls are available:
-    // Thinking (Gemini 3 only) and Camera (any Gemini; Gemma is text-only).
-    bindSelect('sel-model', 'GEMINI_MODEL', () => { updateThinkingAvailability(); updateCameraAvailability(); });
     bindSelect('sel-thinking', 'THINKING_LEVEL');
     bindSelect('sel-lang', 'SPEECH_LANG', (lang) => { if (recog) recog.lang = lang; });
-    updateThinkingAvailability();   // set the initial enabled/greyed state
 
     // Camera toggle → the robot's optional webcam "eyes" (camera.js). Always
     // starts OFF (privacy); ticking it asks for camera permission.
@@ -168,6 +168,132 @@ function wirePromptEditor(el) {
     });
 }
 
+// The Robot section's "use a physical robot" checkbox. Off = the creature lives
+// on the canvas only. Ticking it builds the Pardalote hardware (robot.js →
+// enableHardware), reveals the WiFi/USB connection row — relocated from under the
+// page header into this section, so connect.js stays the shared, unedited file —
+// and makes every gesture play on the real servos too. CONFIG.USE_ROBOT seeds the
+// box's starting state (a teacher can default hardware on).
+function wireRobotPanel() {
+    const box = document.getElementById('robot-toggle');
+    const reveal = document.getElementById('robot-reveal');
+    if (!box || !reveal) return;
+
+    let rowMoved = false;
+    const apply = (on) => {
+        if (on) {
+            const conn = Robot.enableHardware();
+            if (!conn) { box.checked = false; return; }   // Pardalote lib missing — undo the tick
+            // Move the connection row into this section — just ABOVE the actuator
+            // list — the first time; after that it's already here, we just re-show.
+            if (!rowMoved && conn.row) { reveal.insertBefore(conn.row, document.getElementById('actuators')); rowMoved = true; }
+            reveal.hidden = false;
+        } else {
+            Robot.disableHardware();
+            reveal.hidden = true;
+        }
+    };
+
+    box.checked = !!CONFIG.USE_ROBOT;
+    box.addEventListener('change', () => apply(box.checked));
+    if (box.checked) apply(true);   // config defaulted hardware on
+}
+
+// The actuator list in the Physical Robot section — add/remove actuators, pick
+// each one's type (Bus servo / PWM servo / Stepper) and set its pins/ID, plus the
+// bus RX/TX pins. Mirrors the Pardalote Gesture Builder's output setup. Every edit
+// is pushed to robot.js (Robot.applyActuators), which persists it and, when the
+// board is live, attaches/detaches on the fly. A gesture plays on the actuator
+// whose NAME matches the gesture's lane.
+function wireActuatorPanel() {
+    const host = document.getElementById('actuators');
+    if (!host || !Robot.actuatorTypes) return;
+    const TYPES = Robot.actuatorTypes();
+    let items = Robot.getActuators();   // working copy the UI edits
+    let bus = Robot.getBus();
+
+    const apply = () => Robot.applyActuators(items, bus);
+    const span = (cls, txt) => { const s = document.createElement('span'); s.className = cls; s.textContent = txt; return s; };
+    const numField = (val, min, max, onChange) => {
+        const i = document.createElement('input');
+        i.type = 'number'; i.className = 'act-num'; i.value = (val == null ? '' : val);
+        if (min != null) i.min = min; if (max != null) i.max = max;
+        i.placeholder = '—';
+        i.addEventListener('change', () => { onChange(i.value); apply(); });
+        return i;
+    };
+
+    const render = () => {
+        host.innerHTML = '';
+
+        // Bus RX/TX (ESP32 bus-servo UART; ignored on a UNO R4).
+        const busRow = document.createElement('div');
+        busRow.className = 'row act-bus';
+        busRow.append(span('lbl', 'Bus'),
+            span('act-flbl', 'RX'), numField(bus.rx, 0, 99, (v) => bus.rx = v === '' ? null : +v),
+            span('act-flbl', 'TX'), numField(bus.tx, 0, 99, (v) => bus.tx = v === '' ? null : +v),
+            span('mut', 'ESP32 only — UNO R4 uses D0/D1'));
+        host.appendChild(busRow);
+
+        // One row per actuator.
+        items.forEach((a, idx) => host.appendChild(buildActuatorRow(a, idx)));
+
+        const add = document.createElement('button');
+        add.type = 'button'; add.className = 'act-add'; add.textContent = '+ Add actuator';
+        add.addEventListener('click', () => {
+            items.push({ name: '', type: 'busservo', id: null, pin: null, step: null, dir: null, en: -1 });
+            apply(); render();
+        });
+        host.appendChild(add);
+    };
+
+    const buildActuatorRow = (a, idx) => {
+        const row = document.createElement('div');
+        row.className = 'row act-row';
+
+        const name = document.createElement('input');
+        name.type = 'text'; name.className = 'act-name'; name.value = a.name; name.placeholder = 'name';
+        name.addEventListener('change', () => { a.name = name.value.trim(); apply(); });
+
+        const sel = document.createElement('select');
+        sel.className = 'act-type';
+        Object.keys(TYPES).forEach((t) => {
+            const o = document.createElement('option');
+            o.value = t; o.textContent = TYPES[t].label; if (a.type === t) o.selected = true;
+            sel.appendChild(o);
+        });
+        sel.addEventListener('change', () => { a.type = sel.value; apply(); render(); });   // fields follow the type
+
+        const fields = document.createElement('span');
+        fields.className = 'act-fields';
+        (TYPES[a.type].fields || []).forEach((f) => {
+            fields.append(span('act-flbl', f.label),
+                numField(a[f.key], f.min, f.max, (v) => { a[f.key] = (v === '' ? (f.key === 'en' ? -1 : null) : +v); }));
+        });
+
+        const del = document.createElement('button');
+        del.type = 'button'; del.className = 'gicon gicon-del'; del.textContent = '✕'; del.title = 'remove';
+        del.addEventListener('click', () => { items.splice(idx, 1); apply(); render(); });
+
+        row.append(name, sel, fields, del);
+        return row;
+    };
+
+    // Reset to defaults — restore the four creature joints (config.js) and bus
+    // pins, then re-read the working copy and redraw. Matches the System Prompt
+    // panel's reset.
+    const resetBtn = document.getElementById('robot-reset');
+    if (resetBtn) resetBtn.addEventListener('click', () => {
+        Robot.resetActuators();
+        items = Robot.getActuators();
+        bus = Robot.getBus();
+        render();
+        setStatus('actuators reset to the defaults');
+    });
+
+    render();
+}
+
 // The Gestures panel: one editable card per authored gesture (from gestures.js)
 // — its name, description, and lanes (the segment schedule). Paste a gesture from
 // the Pardalote Gesture Builder into a Lanes field to try your own. Per-gesture
@@ -214,19 +340,21 @@ function renderGestureCards() {
 
 // Keep the read-only gesture list in the prompt panel in step with edits (the LLM
 // itself reads GESTURES fresh each turn, so this is just the on-screen mirror).
-// The schema's gesture enum changes with the vocabulary too, so refresh it here.
+// The schema's gesture enum tracks the vocabulary too, so refresh it here.
 function refreshGestureMirror() {
     const glist = document.getElementById('prompt-gestures');
     if (glist) glist.value = Robot.gestureCatalogue().map((g) => `- ${g.name}: ${g.desc}`).join('\n');
     renderSchema();
 }
 
-// Render the read-only Response schema panel — the exact structured-output shape
-// the model must return (Brain.responseSchema()), pretty-printed. A teaching
-// surface: the API enforces this shape, separate from the editable system prompt.
+// Render the read-only Response Schema panel — the exact structured-output shape
+// the model must return (Brain.responseSchema()), pretty-printed. Students edit
+// this in the CODE (brain.js → responseSchema); the panel just shows the current
+// contract, and it updates here as gestures are added or hidden (the enum tracks
+// them). What each field DOES lives in actions.js.
 function renderSchema() {
     const el = document.getElementById('schema-view');
-    if (!el || !(typeof Brain !== 'undefined') || !Brain.responseSchema) return;
+    if (!el || typeof Brain === 'undefined' || !Brain.responseSchema) return;
     try { el.textContent = JSON.stringify(Brain.responseSchema(), null, 2); }
     catch (e) { el.textContent = '// could not read the schema'; }
 }
@@ -318,7 +446,18 @@ function buildGestureCard(name, g) {
     let hidden = !!g.hidden;
     const showHide = () => { hideBtn.textContent = hidden ? '🙈' : '👁'; hideBtn.title = hidden ? 'hidden from the LLM' : 'offered to the LLM'; };
     showHide();
-    hideBtn.addEventListener('click', () => { hidden = !hidden; showHide(); card.classList.toggle('gcard-hidden', hidden); });
+    hideBtn.addEventListener('click', () => {
+        hidden = !hidden; showHide(); card.classList.toggle('gcard-hidden', hidden);
+        // Visibility is the one control whose whole job is to change what the LLM
+        // is offered, so apply it LIVE for an already-saved gesture: update
+        // GESTURES, persist, and refresh the read-only list + schema enum. (A
+        // brand-new, unsaved card has no GESTURES entry yet — it commits when you
+        // leave a field.)
+        if (key && GESTURES[key]) {
+            if (hidden) GESTURES[key].hidden = true; else delete GESTURES[key].hidden;
+            saveGestures(); refreshGestureMirror();
+        }
+    });
 
     const playBtn = document.createElement('button');
     playBtn.type = 'button'; playBtn.className = 'gicon gicon-play'; playBtn.textContent = '▶'; playBtn.title = 'play';
@@ -326,13 +465,10 @@ function buildGestureCard(name, g) {
     const tuneBtn = document.createElement('button');
     tuneBtn.type = 'button'; tuneBtn.className = 'gicon'; tuneBtn.textContent = '⚙'; tuneBtn.title = 'scale · speed · crop';
 
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'button'; saveBtn.className = 'gicon'; saveBtn.textContent = '💾'; saveBtn.title = 'save (apply + remember in this browser)';
-
     const delBtn = document.createElement('button');
     delBtn.type = 'button'; delBtn.className = 'gicon gicon-del'; delBtn.textContent = '🗑'; delBtn.title = 'delete';
 
-    head.append(nameEl, hideBtn, playBtn, tuneBtn, saveBtn, delBtn);
+    head.append(nameEl, hideBtn, playBtn, tuneBtn, delBtn);
 
     const descEl = document.createElement('input');
     descEl.type = 'text'; descEl.className = 'gcard-desc'; descEl.value = g.desc || '';
@@ -365,12 +501,15 @@ function buildGestureCard(name, g) {
         if (state === STATE.IDLE) setStatus('idle — press SPACE to talk');
     });
 
-    // Save — apply the card's fields to the live GESTURES (the robot's playGesture
-    // and the LLM's vocabulary both read it fresh) and persist. Handles rename
-    // (preserving key order) and first-save of a new card.
-    saveBtn.addEventListener('click', () => {
+    // Autosave — apply the card's fields to the live GESTURES (the robot's
+    // playGesture and the LLM's vocabulary both read it fresh) and persist. Runs
+    // when you leave any field (blur); there's no Save button. Handles rename
+    // (preserving key order) and the first save of a new card. An unnamed card is
+    // skipped silently; a bad Lanes syntax or a name clash warns on the status
+    // line and leaves your text untouched so you can fix it (no focus stealing).
+    const commit = () => {
         const newName = nameEl.value.trim();
-        if (!newName) { setStatus('give the gesture a name'); nameEl.focus(); return; }
+        if (!newName) return;                       // unnamed card — nothing to save yet
         let lanes;
         try { lanes = parseLanes(lanesEl.value); }
         catch (e) { setStatus(`couldn't read the lanes for "${newName}" — check the syntax`); return; }
@@ -392,7 +531,10 @@ function buildGestureCard(name, g) {
         saveGestures();
         refreshGestureMirror();
         setStatus(`saved "${newName}"`);
-    });
+    };
+    nameEl.addEventListener('blur', commit);
+    descEl.addEventListener('blur', commit);
+    lanesEl.addEventListener('blur', commit);
 
     // Delete — remove from GESTURES (if it was saved) and persist; drop the card.
     delBtn.addEventListener('click', () => {
@@ -465,7 +607,7 @@ function buildTunePanel() {
 function updateThinkingAvailability() {
     const sel = document.getElementById('sel-thinking');
     const note = document.getElementById('thinking-note');
-    const ok = Brain.supportsThinkingLevel(CONFIG.GEMINI_MODEL);
+    const ok = Brain.supportsThinkingLevel(Brain.getModel());
     if (sel) sel.disabled = !ok;
     if (note) note.hidden = ok;
 }
@@ -476,10 +618,93 @@ function updateThinkingAvailability() {
 function updateCameraAvailability() {
     const box = document.getElementById('cam-toggle');
     const note = document.getElementById('cam-note');
-    const ok = Brain.supportsVision(CONFIG.GEMINI_MODEL);
+    const ok = Brain.supportsVision(Brain.getModel());
     if (box) box.disabled = !ok;
     if (note) note.hidden = ok;
     if (!ok && Webcam.isRequested()) { Webcam.disable(); if (box) box.checked = false; }
+}
+
+// Provider / Model / Key — one linked group. The Provider dropdown switches the
+// whole set: the model list, the remembered model, the saved key + its hint, and
+// which model-dependent controls are available. Built from brain.js's provider
+// registry, so adding a provider there makes it appear here with no UI changes.
+function wireProviderControls(el) {
+    const provSel = el('sel-provider');
+    const modelSel = el('sel-model');
+    const keyField = el('gemini-key');
+
+    if (provSel) {
+        provSel.innerHTML = '';
+        Brain.providers().forEach((p) => {
+            const o = document.createElement('option');
+            o.value = p.id; o.textContent = p.label;
+            provSel.appendChild(o);
+        });
+        provSel.value = Brain.getProviderId();
+        provSel.addEventListener('change', () => { Brain.setProviderId(provSel.value); refreshProviderUI(); });
+    }
+
+    // Model change → remember it (per provider) and re-check Thinking/Camera.
+    if (modelSel) modelSel.addEventListener('change', () => {
+        Brain.setModel(modelSel.value);
+        updateThinkingAvailability();
+        updateCameraAvailability();
+    });
+
+    // Key field → the active provider's own key, saved in this browser only.
+    if (keyField) keyField.addEventListener('input', () => Brain.setKey(keyField.value));
+
+    refreshProviderUI();   // fill everything for the saved provider
+}
+
+// Repaint the Model menu, Key field, and key hint for the ACTIVE provider, then
+// re-check which controls apply. Called on load and whenever the provider changes.
+function refreshProviderUI() {
+    const modelSel = document.getElementById('sel-model');
+    const keyField = document.getElementById('gemini-key');
+    const hint = document.getElementById('key-hint');
+    const kh = Brain.providerKeyHint();
+
+    if (modelSel) {
+        modelSel.innerHTML = '';
+        Brain.providerModels().forEach((g) => {
+            const og = document.createElement('optgroup');
+            og.label = g.label;
+            (g.options || []).forEach((o) => {
+                const opt = document.createElement('option');
+                opt.value = o.value; opt.textContent = o.label;
+                og.appendChild(opt);
+            });
+            modelSel.appendChild(og);
+        });
+        const want = Brain.getModel();
+        modelSel.value = want;
+        // Saved model not in this provider's list → adopt (and remember) the first.
+        if (modelSel.value !== want) {
+            const first = modelSel.querySelector('option');
+            if (first) { modelSel.value = first.value; Brain.setModel(first.value); }
+        }
+    }
+
+    if (keyField) {
+        keyField.value = Brain.getKey();
+        keyField.placeholder = kh.placeholder || 'paste your API key';
+    }
+
+    if (hint) {
+        hint.innerHTML = '';
+        if (kh.text) hint.append(document.createTextNode(kh.text + ' '));
+        if (kh.url) {
+            const a = document.createElement('a');
+            a.href = kh.url; a.target = '_blank'; a.rel = 'noopener';
+            a.textContent = kh.link || kh.url;
+            hint.append(a, document.createTextNode('.'));
+        }
+        hint.append(document.createTextNode(' Kept in this browser only — never written to a file.'));
+    }
+
+    updateThinkingAvailability();
+    updateCameraAvailability();
 }
 
 // Route typed text through the same loop as a spoken utterance. Interrupts a
@@ -543,6 +768,15 @@ function setStatus(s) {
     statusLine = s;
     const el = document.getElementById('status');
     if (el) el.textContent = 'status: ' + s;
+}
+
+// Readout setters, called by actions.js handlers so the on-screen ROBOT / gesture
+// lines reflect what the reply actually did. draw() renders these each frame.
+function showReply(text) { lastReply = String(text || ''); }
+function showGesture(name, scale, speed) {
+    lastGesture = String(name || '');
+    lastScale = Number.isFinite(+scale) ? +scale : 1;
+    lastSpeed = Number.isFinite(+speed) ? +speed : 1;
 }
 
 // SPACE is the one control. What it does depends on the state.
@@ -617,6 +851,7 @@ function cancelListening() {
 // sttMs = how long speech→text took (from the mic), or null when typed.
 async function runTurn(text, sttMs = null) {
     const myTurn = ++turnId;
+    readoutScroll = 0;                   // new turn → show the text region from the top
     const tStart = performance.now();    // start the think timer
     // Grab one webcam frame NOW (what the robot saw when you spoke), or null if
     // the camera is off. It rides along to Gemini so the reply can react to it.
@@ -632,16 +867,15 @@ async function runTurn(text, sttMs = null) {
     startFaceGesture(Robot.FILLER_GESTURE, 1400);
     Robot.playGesture(Robot.FILLER_GESTURE, 0.5);
 
-    const directive = await Brain.askGeminiForGesture(text, history, image);
+    const directive = await Brain.askForDirective(text, history, image);
     if (myTurn !== turnId) return;       // a barge-in superseded this turn
 
-    history.push({ role: 'model', text: directive.speech });
+    // Remember the turn for the model's short memory. Normally that's the spoken
+    // reply; an edited schema might rename or drop `speech`, so fall back to the
+    // whole JSON so the context still makes sense.
+    history.push({ role: 'model', text: (typeof directive.speech === 'string') ? directive.speech : JSON.stringify(directive) });
     trimHistory();
 
-    lastReply = directive.speech;
-    lastGesture = directive.gesture;
-    lastScale = directive.scale;
-    lastSpeed = directive.speed;
     // Show a fallback's reason on screen (so failures aren't silent), and clear
     // it on the next successful turn — a good directive has no `error`, so this
     // resets to '' automatically.
@@ -663,18 +897,17 @@ async function runTurn(text, sttMs = null) {
     setState(STATE.SPEAKING);
     setStatus('speaking…');
 
-    // Gesture and speech together.
-    startFaceGesture(directive.gesture, gestureDurationGuess(directive.gesture, directive.speed));
-    const gesturePromise = Robot.playGesture(directive.gesture, directive.scale, directive.gaze, directive.speed);
-    const speechPromise = speak(directive.speech);
-
-    await Promise.all([gesturePromise, speechPromise]);
+    // Act on the reply. Each field runs its handler in actions.js — speech is
+    // spoken, gesture is played (reading scale/speed/gaze), and any field you add
+    // runs the handler you give it. Handlers set the on-screen readout and return
+    // promises for anything that takes time; we wait for them all together.
+    await Actions.run(directive);
     if (myTurn !== turnId) return;       // barged-in during the reply
 
     setState(STATE.IDLE);
     // If this turn fell back, leave the reason in the status line — otherwise it
     // would flash past as 'speaking…' and you'd never see why it didn't work.
-    setStatus(lastError ? '⚠ ' + lastError : 'idle — press SPACE to talk');
+    setStatus(lastError ? '⚠ ' + lastError : 'idle — press SPACE to talk, or type below');
     Robot.park();
 }
 
@@ -826,57 +1059,114 @@ function drawFace() {
 }
 
 function drawReadout() {
-    const x = 28, top = 396, colW = W - 2 * x;   // symmetric margins keep text on-canvas
-    textAlign(LEFT, TOP);
-    // drawFace() leaves rectMode(CENTER) set for its state pill; p5's text() box
-    // respects rectMode, so without this the boxed you/robot lines get centred on
-    // x and run off the left edge. Reset to CORNER before any boxed text.
+    push();
+    // drawFace() leaves rectMode(CENTER); p5's text() box + our rects want CORNER.
     rectMode(CORNER);
     noStroke();
+    textAlign(LEFT, TOP);
 
-    // What you said (spoken or typed) — the prominent line.
-    fill(GREY); textSize(11); text('YOU', x, top);
+    const regionH = READOUT.bottom - READOUT.top;
+    const bodyW = READOUT.w - 14;    // leave a gutter for the scrollbar
+    const LH = 19, LBL = 15, GAP = 12;
+
+    // --- scrollable YOU / ROBOT text (clipped to the region) -----------
+    const dc = drawingContext;
+    dc.save();
+    dc.beginPath();
+    dc.rect(READOUT.x, READOUT.top, READOUT.w, regionH);
+    dc.clip();
+
+    let y = READOUT.top - readoutScroll;
+
+    fill(GREY); textSize(11); text('YOU', READOUT.x, y); y += LBL;
     fill(INK); textSize(14);
-    text(lastUser || '—', x, top + 15, colW, 38);
+    for (const ln of wrapLines(lastUser || '—', bodyW)) { text(ln, READOUT.x, y); y += LH; }
+    y += GAP;
 
-    // What the robot said back.
-    fill(GREY); textSize(11); text('ROBOT', x, top + 60);
+    fill(GREY); textSize(11); text('ROBOT', READOUT.x, y); y += LBL;
     fill(INK); textSize(14);
-    text(lastReply || '—', x, top + 75, colW, 44);
+    for (const ln of wrapLines(lastReply || '—', bodyW)) { text(ln, READOUT.x, y); y += LH; }
 
-    // gesture + scale + speed
+    dc.restore();
+
+    // Measure content this frame → scroll bounds (clamp any overscroll).
+    const contentH = (y + readoutScroll) - READOUT.top;
+    readoutMax = Math.max(0, contentH - regionH);
+    if (readoutScroll > readoutMax) readoutScroll = readoutMax;
+
+    // Scrollbar thumb, only when the text overflows the region.
+    if (readoutMax > 0) {
+        const barX = READOUT.x + READOUT.w - 3;
+        const thumbH = Math.max(24, regionH * regionH / contentH);
+        const thumbY = READOUT.top + (readoutScroll / readoutMax) * (regionH - thumbH);
+        fill(HAIR); rect(barX, READOUT.top, 3, regionH);
+        fill(GREY); rect(barX, thumbY, 3, thumbH);
+    }
+
+    // --- pinned footer near the canvas bottom: error · gesture · timing ---
+    if (lastError) {
+        // one line here (the full text is also in the status line below the canvas)
+        fill(RED); textSize(12);
+        text('⚠ ' + lastError, READOUT.x, H - 66, READOUT.w, 18);
+    }
+
     fill(GREY); textSize(12);
     const gline = lastGesture ? `gesture: ${lastGesture}   scale: ${lastScale.toFixed(2)}×   speed: ${lastSpeed.toFixed(2)}×` : 'gesture: —';
-    text(gline, x, top + 128);
+    text(gline, READOUT.x, H - 44);
 
-    // timing line — the trip up to the response, broken into parts. STT only
-    // appears when the turn came from the mic (typed turns skip speech→text).
     if (lastTiming) {
         fill(TEAL); textSize(12);
         const line = (lastTiming.stt != null)
             ? '⏱ stt ' + fmtDur(lastTiming.stt) + '  ·  think ' + fmtDur(lastTiming.think)
               + '  ·  total ' + fmtDur(lastTiming.total)
             : '⏱ think ' + fmtDur(lastTiming.think);
-        text(line, x, top + 148);
+        text(line, READOUT.x, H - 24);
     }
 
-    // error line — only when the last turn fell back (bad model, no key, quota…).
-    // Two lines tall, since messages like a 404 model error wrap past one.
-    if (lastError) {
-        fill(RED); textSize(12);
-        text('⚠ ' + lastError, x, top + 168, colW, 32);
-    }
-
-    // hint — right-aligned, on the gesture line
-    fill(GREY); textSize(12);
+    // hint — right-aligned on the gesture line. Only the genuinely useful,
+    // contextual ones; nothing in the plain idle state (the input placeholder
+    // covers that).
     const hint = !speechSupported
         ? 'No mic here (Chrome only) — type below and press Enter'
         : state === STATE.SPEAKING
             ? 'SPACE to interrupt and talk — or type'
-            : 'SPACE to talk, or type below';
-    textAlign(RIGHT, TOP);
-    text(hint, W - x, top + 128);
-    textAlign(LEFT, TOP);
+            : '';
+    if (hint) {
+        fill(GREY); textSize(12);
+        textAlign(RIGHT, TOP);
+        text(hint, W - READOUT.x, H - 44);
+    }
+
+    pop();
+}
+
+// Wrap a string to width `w` at the CURRENT textSize (keeps explicit newlines).
+// Returns an array of lines, so we can measure height and scroll precisely.
+function wrapLines(str, w) {
+    const out = [];
+    for (const para of String(str).split('\n')) {
+        const words = para.split(/\s+/).filter((s) => s.length);
+        if (!words.length) { out.push(''); continue; }
+        let line = '';
+        for (const word of words) {
+            const test = line ? line + ' ' + word : word;
+            if (textWidth(test) > w && line) { out.push(line); line = word; }
+            else line = test;
+        }
+        out.push(line);
+    }
+    return out.length ? out : [''];
+}
+
+// Mouse-wheel scrolls the YOU/ROBOT region — but only while hovering it AND it
+// overflows; otherwise the wheel scrolls the page as usual.
+function mouseWheel(e) {
+    if (readoutMax > 0 &&
+        mouseX >= READOUT.x && mouseX <= READOUT.x + READOUT.w &&
+        mouseY >= READOUT.top && mouseY <= READOUT.bottom) {
+        readoutScroll = Math.max(0, Math.min(readoutMax, readoutScroll + e.delta));
+        return false;   // stop the page from scrolling too
+    }
 }
 
 // Format a millisecond duration: seconds (2 dp) at/above 1s, else whole ms.

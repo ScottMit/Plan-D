@@ -1,5 +1,5 @@
 // ==============================================================
-// pardalote.js 1.1.0 — DISTRIBUTION BUNDLE. DO NOT EDIT.
+// pardalote.js 1.4.0 — DISTRIBUTION BUNDLE. DO NOT EDIT.
 // https://github.com/ScottMit/Pardalote
 // Copyright (C) 2026 Scott Mitchell — GPL-3.0-or-later. See LICENSE.
 //
@@ -19,7 +19,7 @@
 // Product version — the release humans see. Canonical copy lives in
 // package.json; mirrored here so a page can ask at runtime
 // (Arduino.version). The wire protocol versions independently below.
-const PARDALOTE_VERSION = '1.1.0';
+const PARDALOTE_VERSION = '1.4.0';
 
 // Wire-protocol MAJOR this build speaks — compared against the
 // firmware's HELLO. A mismatch means the two sides cannot talk.
@@ -91,6 +91,10 @@ const LIMIT_MAX = 1;
 // defs.h's shapeCurve() too, or authoring preview and board motion drift.
 // -------------------------------------------------------------------
 const GESTURE_FLAG_ABSOLUTE = 0x01;   // segment value is an absolute target, not a relative delta
+// Gesture DONE outcome — optional 3rd param of CMD_*_DONE (defs.h must agree).
+// Sent only when a gesture finishes; missing = arrived (plain moves, old firmware).
+const DONE_ARRIVED = 0;   // reached the final target
+const DONE_GAVE_UP = 1;   // landing timed out — holding where it got to
 const GESTURE_FLAG_LOOP     = 0x02;   // repeat the schedule (reserved)
 
 // Curated easing set (0x05+ reserved for elastic/bounce later).
@@ -985,6 +989,34 @@ class Extension {
     // switch sessions. Preserve user-tuned configuration. Default is a no-op;
     // extensions override as needed.
     _reset() {}
+
+    // Let go of this instance's board hardware — called by arduino.remove()
+    // (and by add() replacing a name) BEFORE its logical id is freed for
+    // reuse. Default: detach() if the extension has one and is attached.
+    // Extensions with no detach override (e.g. NeoPixel blanks its strip).
+    _release() {
+        if (typeof this.detach === 'function' && this.isAttached !== false) this.detach();
+    }
+
+    // How many instances of this device the board can hold at once — its
+    // firmware slot table size (MAX_SERVOS etc.). Logical ids are slot
+    // indexes, 0 … maxInstances−1. Subclasses set it; undefined = no cap known.
+    static maxInstances = undefined;
+}
+
+// A removed extension's `arduino` is swapped for this inert stand-in, so a
+// stale reference (a variable, a closure, a pending timer) can't drive
+// whatever actuator now owns its freed id. Every call warns once, sends nothing.
+function _removedArduino(ext) {
+    let warned = false;
+    const noop = () => {
+        if (!warned) {
+            warned = true;
+            console.warn(`${ext.constructor.name} '${ext._name}': it was removed (arduino.remove) — ` +
+                         `nothing is sent. Create a new one with arduino.add().`);
+        }
+    };
+    return new Proxy({}, { get: () => noop });
 }
 
 // -------------------------------------------------------------------
@@ -1192,15 +1224,23 @@ class Arduino {
         this._aliases  = {};
         this.analogMax = 1023;   // safe default; overwritten by HELLO
 
-        // Heartbeat — liveness is judged by the AGE OF THE LAST PONG.
-        // A power-cycled board sends no FIN, and send() into a half-open
-        // TCP connection doesn't throw (it just buffers), so without this
-        // check the browser would sit "connected" until the rebooted
+        // Heartbeat — a power-cycled board sends no FIN, and send() into a
+        // half-open TCP connection doesn't throw (it just buffers), so without
+        // this check the browser would sit "connected" until the rebooted
         // board's new TCP stack resets the stale connection.
+        //
+        // The link is declared dead only when BOTH hold: several pings have
+        // gone unanswered AND nothing at all has arrived for a while. Any
+        // inbound frame counts as life, not just a pong. Counting pings (not
+        // just time) means a page that was itself frozen — a heavy ML model,
+        // a busy machine, a throttled background tab — sent no pings while
+        // frozen, so it can't mistake its own stall for a dead board.
         this._pingInterval  = null;
-        this._lastPong      = 0;
+        this._lastRx        = 0;      // Date.now() of the last frame received
+        this._unanswered    = 0;      // pings sent since the last frame received
         this._pingMs        = 3000;   // send a ping every 3 s
-        this._pongTimeoutMs = 5000;   // declare the link dead if no pong for 5 s
+        this._maxUnanswered = 3;      // …declare the link dead after 3 unanswered pings
+        this._rxTimeoutMs   = 10000;  // …and 10 s with nothing received
 
         // Pin handles (see arduino.pin()): Map<number|aliasString, Pin>.
         // Permanent, like extension instances — listeners survive connect().
@@ -1214,7 +1254,6 @@ class Arduino {
         this._extensions  = {};
         this._extByDevice = new Map();
         this._available   = new Set();  // deviceIds announced by Arduino
-        this._nextId      = 0;
 
         // Actuator groups, keyed by name (see group())
         this._groups      = {};
@@ -1232,22 +1271,35 @@ class Arduino {
         this.defaultThreshold = 0;     // 0 = board default: 1 for digital,
                                        // the ADC noise floor for analog
 
-        // PWM write throttle — the OUTBOUND counterpart to the read rate
-        // limit above. analogWrite() driven from a slider or draw loop can
-        // fire dozens of times a second; an unthrottled flood overruns a
-        // slow board's inbound buffer (the UNO R4 WiFi's WiFiS3 link can't
-        // drain it), so the queue grows, latency climbs, and the socket
-        // eventually drops. This caps the send rate per pin: the first
-        // write in a burst goes out immediately, further writes inside the
-        // window are coalesced into one trailing send carrying the LATEST
-        // value, so the resting position is never lost. Mirrors the servo /
-        // neopixel throttle. 0 = off (send every value). ESP32 is fast
-        // enough that the default is imperceptible; the UNO R4 needs it.
-        this.writeThrottle  = 20;      // min ms between PWM sends per pin
-        this.writeThreshold = 0;       // min value change worth sending (0 = all)
-        this._pwmLastWrite  = new Map(); // Map<pin, ms>      — last send time
-        this._pwmLastSent   = new Map(); // Map<pin, value>   — last value sent
-        this._pwmPending     = new Map(); // Map<pin, timeoutId> — coalesced trailing send
+        // Pin write rate control — the OUTBOUND counterpart to the read rate
+        // limit above. digitalWrite()/analogWrite() driven from a slider or
+        // a draw loop can fire dozens of times a second; an unthrottled
+        // flood overruns a slow board's inbound buffer (the UNO R4 WiFi's
+        // WiFiS3 link can't drain it) or starves a busy one (an ESP32 also
+        // streaming camera video), so the queue grows, heartbeats stall, and
+        // the socket drops. Two rules, per pin:
+        //
+        //   CHANGES — digitalWrite() sends at once, so a short pulse is never
+        //   lost. analogWrite() sends the first write in a burst at once and
+        //   coalesces writes inside writeThrottle into one trailing send
+        //   carrying the LATEST value, so the resting duty is never lost.
+        //   Mirrors the servo / neopixel throttle. ESP32 is fast enough
+        //   that the default is imperceptible; the UNO R4 needs it.
+        //
+        //   REPEATS — a value equal to the last one sent on the pin is re-sent
+        //   at most once per writeRepeat. Repeats aren't dropped outright:
+        //   the board sketch or another browser may have changed the pin
+        //   since, and the re-send puts this page's value back.
+        //
+        // While disconnected, writes are only recorded — _onSyncComplete
+        // replays each pin's latest value once, so a reconnect never flushes
+        // a backlog of stale writes. 0 disables a rule (send every value).
+        this.writeThrottle  = 20;      // min ms between PWM changes per pin
+        this.writeThreshold = 0;       // min PWM change worth sending (0 = all)
+        this.writeRepeat    = 250;     // min ms between re-sends of an unchanged value
+        this._writeLast     = new Map(); // Map<pin, {cmd, value, time}> — last write sent
+        this._pwmValues     = new Map(); // Map<pin, duty> — latest analogWrite(), replayed on reconnect
+        this._pwmPending    = new Map(); // Map<pin, timeoutId> — coalesced trailing send
     }
 
     // -------------------------------------------------------------------
@@ -1360,6 +1412,7 @@ class Arduino {
         this._available.clear();
         this.messages = {};                                     // cached message values are board state
         this._queue = [];                                       // drop frames queued for the old board
+        this._pwmValues.clear();                                // PWM duties are board state too
         this._pwmCancelPending();                               // drop any coalesced PWM send aimed at the old board
 
         // Board-created (shared) objects belong to the previous board —
@@ -1415,7 +1468,7 @@ class Arduino {
         // (so a late close can't double-fire 'disconnect'), which also means the
         // onclose that normally calls _stopHeartbeat() won't fire — leaving the
         // old transport's heartbeat ticking into the next connection. On a
-        // WiFi→USB switch that stale heartbeat fires "no pong" during the board's
+        // WiFi→USB switch that stale heartbeat times out during the board's
         // reboot window and tears down the in-flight serial link (→ reconnect
         // churn). Stopping it here makes a switch clean.
         this._stopHeartbeat();
@@ -1743,6 +1796,10 @@ class Arduino {
     }
 
     _dispatch(frame) {
+        // Any frame from the board proves the link is alive (heartbeat).
+        this._lastRx     = Date.now();
+        this._unanswered = 0;
+
         // Frame monitor — sees every inbound frame (guarded: no-op unless a
         // listener is registered).
         this._emitFrame('in', frame);
@@ -1841,15 +1898,19 @@ class Arduino {
         }
     }
 
-    // Each tick: first judge liveness by how stale the last pong is,
-    // then send the next ping. Detection worst case is roughly
-    // _pongTimeoutMs + _pingMs (~8 s) after the board dies.
+    // Each tick: first judge liveness, then send the next ping. A board that
+    // dies is detected ~12 s later (3 unanswered pings, 10 s silent); a pong
+    // delayed by a slow link (up to ~9 s) or a page frozen for any length of
+    // time doesn't trip it.
     _startHeartbeat() {
         this._stopHeartbeat();
-        this._lastPong = Date.now();   // HELLO just arrived — link demonstrably alive
+        this._lastRx     = Date.now();   // HELLO just arrived — link demonstrably alive
+        this._unanswered = 0;
         this._pingInterval = setInterval(() => {
-            if (Date.now() - this._lastPong > this._pongTimeoutMs) {
-                this._warn(`connection lost — no pong for ${this._pongTimeoutMs} ms; reconnecting`);
+            const silentMs = Date.now() - this._lastRx;
+            if (this._unanswered >= this._maxUnanswered && silentMs > this._rxTimeoutMs) {
+                this._warn(`connection lost — nothing received for ${Math.round(silentMs / 1000)} s ` +
+                           `(${this._unanswered} pings unanswered); reconnecting`);
                 this._stopHeartbeat();
                 this._closeSocket();   // detach + null the socket so a late
                                        // close event can't double-fire 'disconnect'
@@ -1858,6 +1919,7 @@ class Arduino {
                 return;
             }
             try { this.socket.send(encodeFrame(CMD_PING, 0, [])); } catch (_) {}
+            this._unanswered++;
         }, this._pingMs);
     }
 
@@ -1866,9 +1928,9 @@ class Arduino {
         this._pingInterval = null;
     }
 
-    _onPong() {
-        this._lastPong = Date.now();
-    }
+    // A pong needs no handling of its own — _dispatch already counted it
+    // as life, like every other inbound frame.
+    _onPong() {}
 
     // The board announced (over serial) that it just (re)booted — e.g. a reset
     // while USB-connected. The port is still open, so rather than wait for the
@@ -1879,7 +1941,8 @@ class Arduino {
     // fire mid-recovery; the HELLO that follows the switch restarts everything.
     _onReboot() {
         if (this._transportKind !== 'serial') return;
-        this._lastPong = Date.now();
+        this._lastRx     = Date.now();
+        this._unanswered = 0;
         if (this.socket && typeof this.socket.resumeProbe === 'function') this.socket.resumeProbe();
     }
 
@@ -2006,7 +2069,13 @@ class Arduino {
         });
         this._pinValues.forEach((value, pin) => {
             if (this._pinOrigins.get(pin) === 'board') return;
-            this.send(encodeFrame(CMD_DIGITAL_WRITE, pin, [value]));
+            this._sendPinWrite(pin, CMD_DIGITAL_WRITE, value);
+        });
+        // PWM duties after digital values: a pin whose LAST write was
+        // analogWrite() ends on its duty (digitalWrite() drops a pin's duty,
+        // so a pin last written digitally replays only its level).
+        this._pwmValues.forEach((duty, pin) => {
+            this._sendPinWrite(pin, CMD_ANALOG_WRITE, duty);
         });
 
         // Re-register our periodic reads. The Arduino clears THIS CLIENT's
@@ -2156,24 +2225,77 @@ class Arduino {
     // Extension registration
     // -------------------------------------------------------------------
     add(name, extension) {
-        extension.arduino  = this;
-        // Skip ids already held by board-created objects (they allocate from
-        // the top of the range down; add() from 0 up — this guard only
-        // matters once the two meet).
-        const taken = new Set();
-        this._extByDevice.forEach(list => list.forEach(e => {
-            if (e._sharedFromBoard) taken.add(e.logicalId);
-        }));
-        while (taken.has(this._nextId)) this._nextId++;
-        extension.logicalId = this._nextId++;
-        extension._name = name;
-        this._extensions[name] = extension;
-        this[name] = extension;  // shorthand: arduino.servo
+        if (this._extensions[name] === extension) return this;   // already registered under this name
+        // Replacing a name (e.g. swapping a servo for a stepper) releases the
+        // old instance first — its hardware is detached and its id freed.
+        if (this._extensions[name]) this.remove(name);
 
         const deviceId = extension.constructor.deviceId;
+        const cls      = extension.constructor;
         if (!this._extByDevice.has(deviceId)) this._extByDevice.set(deviceId, []);
-        this._extByDevice.get(deviceId).push(extension);
+        const list = this._extByDevice.get(deviceId);
 
+        // Logical ids are the board's slot indexes FOR THIS DEVICE TYPE
+        // (servo 0 and stepper 0 are different slots), so allocate per
+        // deviceId: the lowest id no live instance of this type holds.
+        // Board-created objects are in the same list (they allocate from the
+        // top of the range down; add() from 0 up), so they're skipped too.
+        // Ids freed by remove() are reused — a page that swaps actuators
+        // never walks off the end of the board's table.
+        const taken = new Set(list.map(e => e.logicalId));
+        let id = 0;
+        while (taken.has(id)) id++;
+        if (cls.maxInstances !== undefined && id >= cls.maxInstances) {
+            this._notify('warn', `${cls.name} '${name}'`,
+                `the board holds at most ${cls.maxInstances} ${cls.name} instances at once — ` +
+                `this one (id ${id}) will be ignored by the board. arduino.remove() one you no longer need.`);
+        }
+
+        extension.arduino   = this;
+        extension.logicalId = id;
+        extension._name     = name;
+        this._extensions[name] = extension;
+        this[name] = extension;  // shorthand: arduino.servo
+        list.push(extension);
+
+        return this;
+    }
+
+    // -------------------------------------------------------------------
+    // remove(name)
+    // The inverse of add(): let go of the extension's hardware on the board
+    // (detach — freeing its pin / bus ID / PWM channel), drop it from any
+    // group, and unregister it so its logical id can be reused by a later
+    // add(). The removed object is left inert: any further call on it warns
+    // and sends nothing (its old id may now belong to another actuator).
+    //   arduino.remove('elbow');
+    // Objects the SKETCH created (PardaloteServo.attach("pan", 9) → arduino.pan)
+    // belong to the sketch — remove() refuses those.
+    // -------------------------------------------------------------------
+    remove(name) {
+        const ext = this._extensions[name];
+        if (!ext) { this._notify('warn', 'remove', `no extension named '${name}'`); return this; }
+        if (ext._sharedFromBoard) {
+            this._notify('warn', ext._label(),
+                `created by the Arduino sketch — it can't be removed from the browser (change the sketch instead)`);
+            return this;
+        }
+
+        ext._release();   // detach on the board while it still holds its id
+        ext._reset();     // cancel pending writes / sweeps, settle awaiters
+
+        delete this._extensions[name];
+        if (this[name] === ext) delete this[name];
+        const list = this._extByDevice.get(ext.constructor.deviceId);
+        if (list) { const i = list.indexOf(ext); if (i >= 0) list.splice(i, 1); }
+        for (const g of Object.values(this._groups)) {
+            for (const [key, m] of Object.entries(g.members)) {
+                if (m === ext) { delete g.members[key]; delete g._commanded[key]; }
+            }
+            g._lastMoved = g._lastMoved.filter(m => m !== ext);
+        }
+
+        ext.arduino = _removedArduino(ext);
         return this;
     }
 
@@ -2322,19 +2444,29 @@ class Arduino {
         value = value ? 1 : 0;
         this._pinValues.set(pin, value);  // stored for announce sync and _onSyncComplete replay
         this._pinOrigins.set(pin, 'browser');   // this page claims the pin — replayed on reconnect
-        this.send(encodeFrame(CMD_DIGITAL_WRITE, pin, [value]));
+        this._pwmValues.delete(pin);            // a digital write ends any PWM on the pin
+        this._pwmCancel(pin);                   // …and a pending trailing duty mustn't override it
+        if (!this.connected) return this;       // recorded — replayed on reconnect
+        // A change goes out at once (a short pulse is never lost); a repeat
+        // at most once per writeRepeat — see the constructor.
+        if (this._isRepeatWrite(pin, CMD_DIGITAL_WRITE, value)) return this;
+        this._sendPinWrite(pin, CMD_DIGITAL_WRITE, value);
         return this;
     }
 
     // analogWrite(pin, value) — write a PWM duty (0–255).
-    // Rate-limited per pin by writeThrottle (see the constructor): the first
-    // write in a burst is sent immediately, rapid follow-ups (a slider drag,
-    // a draw loop) are coalesced into a single trailing send that carries the
-    // final value. Tune with setWriteThrottle()/setWriteThreshold(); set the
-    // throttle to 0 to send every value (the old behaviour).
+    // Rate-limited per pin (see the constructor): the first write in a
+    // burst is sent immediately, rapid follow-ups (a slider drag, a draw
+    // loop) are coalesced into a single trailing send that carries the
+    // final value, and an unchanged duty is re-sent at most once per
+    // writeRepeat. Tune with setWriteThrottle()/setWriteThreshold()/
+    // setWriteRepeat(); 0 turns a rule off.
     analogWrite(pin, value) {
         pin = this._resolvePin(pin);
-        this._pwmScheduleWrite(pin, Math.round(value));
+        value = Math.round(value);
+        this._pwmValues.set(pin, value);        // replayed on reconnect
+        if (!this.connected) { this._pwmCancel(pin); return this; }   // recorded — replayed on reconnect
+        this._pwmScheduleWrite(pin, value);
         return this;
     }
 
@@ -2343,12 +2475,15 @@ class Arduino {
     // write while capping a fast stream. The latest value always wins the
     // trailing slot, so the resting position is never dropped.
     _pwmScheduleWrite(pin, value) {
+        // Already the duty on the board: a pending trailing send would only
+        // overwrite it (latest wins, and it's this one), so cancel it — and
+        // re-send this value at most once per writeRepeat.
+        if (this._isRepeatWrite(pin, CMD_ANALOG_WRITE, value)) { this._pwmCancel(pin); return; }
+        this._pwmCancel(pin);
         if (this.writeThrottle <= 0) { this._pwmSend(pin, value); return; }
-        const now  = Date.now();
-        const wait = this.writeThrottle - (now - (this._pwmLastWrite.get(pin) || 0));
+        const last = this._writeLast.get(pin);
+        const wait = last ? this.writeThrottle - (Date.now() - last.time) : 0;
         if (wait > 0) {
-            const t = this._pwmPending.get(pin);
-            if (t) clearTimeout(t);
             this._pwmPending.set(pin, setTimeout(() => {
                 this._pwmPending.delete(pin);
                 this._pwmSend(pin, value);
@@ -2359,32 +2494,55 @@ class Arduino {
     }
 
     _pwmSend(pin, value) {
-        if (this.writeThreshold > 0 && this._pwmLastSent.has(pin) &&
-            Math.abs(value - this._pwmLastSent.get(pin)) < this.writeThreshold) {
+        if (!this.connected) return;   // trailing send outlived the link — the replay restores it
+        // The threshold skips small CHANGES; an exact repeat is writeRepeat's call.
+        const last = this._writeLast.get(pin);
+        if (this.writeThreshold > 0 && last && last.cmd === CMD_ANALOG_WRITE &&
+            value !== last.value && Math.abs(value - last.value) < this.writeThreshold) {
             return;
         }
-        this.send(encodeFrame(CMD_ANALOG_WRITE, pin, [value]));
-        this._pwmLastWrite.set(pin, Date.now());
-        this._pwmLastSent.set(pin, value);
+        this._sendPinWrite(pin, CMD_ANALOG_WRITE, value);
     }
 
-    // Cancel every coalesced trailing send and forget the per-pin history.
-    // Called on (re)connect so a value queued for the old board never lands
-    // on the new one.
+    // True when value repeats the last write sent on the pin and
+    // writeRepeat hasn't elapsed since.
+    _isRepeatWrite(pin, cmd, value) {
+        const last = this._writeLast.get(pin);
+        return this.writeRepeat > 0 && !!last && last.cmd === cmd &&
+               last.value === value && Date.now() - last.time < this.writeRepeat;
+    }
+
+    // Send one pin write and remember it for the rate-control rules.
+    _sendPinWrite(pin, cmd, value) {
+        this.send(encodeFrame(cmd, pin, [value]));
+        this._writeLast.set(pin, { cmd, value, time: Date.now() });
+    }
+
+    _pwmCancel(pin) {
+        const t = this._pwmPending.get(pin);
+        if (t) { clearTimeout(t); this._pwmPending.delete(pin); }
+    }
+
+    // Cancel every coalesced trailing send and forget the per-pin send
+    // history. Called when switching boards so a value queued for the old
+    // board never lands on the new one.
     _pwmCancelPending() {
         for (const t of this._pwmPending.values()) clearTimeout(t);
         this._pwmPending.clear();
-        this._pwmLastWrite.clear();
-        this._pwmLastSent.clear();
+        this._writeLast.clear();
     }
 
-    // setWriteThrottle(ms) — minimum ms between PWM sends on a pin (0 = off,
-    //   send every value). Applies to all analogWrite() pins. Default 20.
+    // setWriteThrottle(ms) — minimum ms between PWM changes on a pin; faster
+    //   ones coalesce, latest value wins (0 = off). Default 20.
     // setWriteThreshold(v) — minimum duty change worth sending (0 = send all).
-    // Both chainable. Useful when driving analogWrite() from mouse movement
-    // or a draw loop, especially on the UNO R4 WiFi.
+    // setWriteRepeat(ms)   — minimum ms between re-sends of an UNCHANGED
+    //   value, digitalWrite() and analogWrite() alike (0 = send every
+    //   repeat). Default 250.
+    // All chainable. Useful when writing pins from mouse movement or a draw
+    // loop, especially on the UNO R4 WiFi or a camera-streaming ESP32.
     setWriteThrottle(ms)  { this.writeThrottle  = Math.max(0, ms); return this; }
     setWriteThreshold(v)  { this.writeThreshold = Math.max(0, v);  return this; }
+    setWriteRepeat(ms)    { this.writeRepeat    = Math.max(0, ms); return this; }
 
     // digitalRead(pin, interval, threshold) — start/update a board-side watch.
     // digitalRead(pin)      — return cached value; no network traffic.
@@ -2748,9 +2906,11 @@ class Group {
     }
 
     // whenDone({ timeout }?) — Promise for the group's most recent
-    // write()/writeTimed(). Resolves `true` when EVERY moved member reports it
-    // actually ARRIVED (each actuator's 'done' — feedback-confirmed, not a
-    // timer), or `false` on the safety timeout (dead servo / lost link).
+    // write()/writeTimed()/gesture(). Resolves `true` when EVERY moved member
+    // reports it actually ARRIVED (each actuator's 'done' — feedback-confirmed,
+    // not a timer), or `false` if any member didn't: its gesture landing gave up
+    // (held short of the target), or the safety timeout fired (dead servo /
+    // lost link).
     // Members arm their completion promise inside the move itself, so calling
     // whenDone() late is safe — already-finished members resolve immediately.
     //
@@ -2763,7 +2923,9 @@ class Group {
         const timeout = t ?? Math.max(this._lastDuration * 2, 10000);
         const waits = this._lastMoved.map(m => m._movePromise).filter(Boolean);
         if (!waits.length) return Promise.resolve(true);
-        const done = Promise.all(waits).then(() => true);
+        // A member's promise settles `false` only when its gesture gave up
+        // (DONE_GAVE_UP) — the group arrived only if every member did.
+        const done = Promise.all(waits).then(vs => vs.every(v => v !== false));
         if (!timeout) return done;
         return Promise.race([
             done,
@@ -2872,6 +3034,7 @@ const MAX_SERVO_SEGMENTS = 16;
 
 class Servo extends Extension {
     static deviceId = DEVICE_SERVO;
+    static maxInstances = 8;   // board slot table (MAX_SERVOS in PardaloteServo.h)
 
     constructor() {
         super();
@@ -3533,12 +3696,16 @@ class Servo extends Extension {
                 this._resolveAttached(this.isAttached);
                 break;
 
-            case CMD_SERVO_DONE:
+            case CMD_SERVO_DONE: {
+                // Optional 3rd param: gesture outcome (missing = arrived).
+                const arrived = (frame.params[2] ?? DONE_ARRIVED) === DONE_ARRIVED;
                 this.angle  = frame.params[1];
                 this.micros = this._angleToMicros(this.angle);
-                this._emit('done', { angle: this.angle });
-                this._resolveDone();
+                this._emit('done', { angle: this.angle, arrived });
+                this._resolveDone(arrived);
                 break;
+
+            }
 
             case CMD_SERVO_GESTURE_STATE: {
                 // A board segment schedule started/ended (authored by JS OR the
@@ -3555,10 +3722,11 @@ class Servo extends Extension {
 
     // Resolves when the servo's timed move completes (CMD_SERVO_DONE).
     _whenDone() { return new Promise(resolve => this._doneResolvers.push(resolve)); }
-    _resolveDone() {
+    // Settles with `arrived` (false = a gesture gave up); other drains pass nothing.
+    _resolveDone(arrived = true) {
         const resolvers = this._doneResolvers;
         this._doneResolvers = [];
-        resolvers.forEach(r => r(this.angle));
+        resolvers.forEach(r => r(arrived));
     }
 
     // Arm the whenDone() promise for a move that will emit 'done'.
@@ -3569,7 +3737,8 @@ class Servo extends Extension {
 
     // whenDone({ timeout }?) — Promise for the most recent move. Resolves
     // `true` on the servo's 'done' (or immediately if no move is pending /
-    // it already finished), `false` on the safety timeout. timeout: ms
+    // it already finished), `false` if it didn't arrive (a gesture that gave
+    // up, or the safety timeout). timeout: ms
     // (default max(duration × 2, 10000); 0 = wait forever). Also accepts a
     // bare number: whenDone(5000).
     //
@@ -3578,7 +3747,9 @@ class Servo extends Extension {
         const t = (typeof opts === 'number') ? opts : opts.timeout;
         const timeout = t ?? Math.max(this._moveDuration * 2, 10000);
         if (!this._movePromise) return Promise.resolve(true);
-        const done = this._movePromise.then(() => true);
+        // Settles `false` only on a gesture that gave up (DONE_GAVE_UP); every
+        // other completion (plain-move DONE, stop, disconnect) means done.
+        const done = this._movePromise.then(v => v !== false);
         if (!timeout) return done;
         return Promise.race([
             done,
@@ -3672,6 +3843,7 @@ const BUSSERVO_MODE_WHEEL    = 1;
 
 class BusServo extends Extension {
     static deviceId = DEVICE_BUSSERVO;
+    static maxInstances = 16;   // board slot table (MAX_BUS_SERVOS in PardaloteBusServo.h)
 
     constructor() {
         super();
@@ -4199,7 +4371,8 @@ class BusServo extends Extension {
     // whenDone({ timeout }?) — Promise for the most recent move. Resolves
     // `true` on CMD_BUSSERVO_DONE (the servo's own Moving flag settled — real
     // arrival, not a timer; or immediately if no move is pending / it already
-    // finished), `false` on the safety timeout. timeout: ms (default
+    // finished), `false` if it didn't arrive (a gesture that gave up, or the
+    // safety timeout). timeout: ms (default
     // max(duration × 2, 10000); 0 = wait forever). Also accepts a bare
     // number: whenDone(5000).
     //
@@ -4208,7 +4381,9 @@ class BusServo extends Extension {
         const t = (typeof opts === 'number') ? opts : opts.timeout;
         const timeout = t ?? Math.max(this._moveDuration * 2, 10000);
         if (!this._movePromise) return Promise.resolve(true);
-        const done = this._movePromise.then(() => true);
+        // Settles `false` only on a gesture that gave up (DONE_GAVE_UP); every
+        // other completion (plain-move DONE, stop, disconnect) means done.
+        const done = this._movePromise.then(v => v !== false);
         if (!timeout) return done;
         return Promise.race([
             done,
@@ -4272,12 +4447,15 @@ class BusServo extends Extension {
                 break;
             }
 
-            case CMD_BUSSERVO_DONE:
-                // Board polled the Moving flag and the servo has settled.
+            case CMD_BUSSERVO_DONE: {
+                // The servo settled (plain write) or a gesture finished. Optional
+                // 3rd param: gesture outcome (missing = arrived).
+                const arrived = (frame.params[2] ?? DONE_ARRIVED) === DONE_ARRIVED;
                 this.position = frame.params[1];
-                this._emit('done', { position: this.position });
-                this._drain(this._doneResolvers, this.position);
+                this._emit('done', { position: this.position, arrived });
+                this._drain(this._doneResolvers, arrived);
                 break;
+            }
 
             case CMD_BUSSERVO_GESTURE_STATE: {
                 const active = frame.params[1] === 1;
@@ -4524,6 +4702,7 @@ const STEPPER_FULL4WIRE = 4;   // 4 coil pins
 
 class Stepper extends Extension {
     static deviceId = DEVICE_STEPPER;
+    static maxInstances = 6;   // board slot table (MAX_STEPPERS in PardaloteStepper.h)
 
     constructor() {
         super();
@@ -5145,14 +5324,18 @@ class Stepper extends Extension {
                 });
                 break;
 
-            case CMD_STEPPER_DONE:
+            case CMD_STEPPER_DONE: {
+                // Optional 3rd param: gesture outcome (missing = arrived). A
+                // gesture that gave up is holding short of its target.
+                const arrived = (frame.params[2] ?? DONE_ARRIVED) === DONE_ARRIVED;
                 this.position     = frame.params[1];
                 this.distanceToGo = 0;
                 this.isRunning    = false;
-                this.target       = this.position;   // arrived
-                this._emit('done', { position: this.position });
-                this._resolveDone();
+                this.target       = this.position;   // where it stopped
+                this._emit('done', { position: this.position, arrived });
+                this._resolveDone(arrived);
                 break;
+            }
 
             case CMD_STEPPER_GESTURE_STATE: {
                 const active = frame.params[1] === 1;
@@ -5290,10 +5473,11 @@ class Stepper extends Extension {
         return new Promise(resolve => this._doneResolvers.push(resolve));
     }
 
-    _resolveDone() {
+    // Settles with `arrived` (false = a gesture gave up); other drains pass nothing.
+    _resolveDone(arrived = true) {
         const resolvers = this._doneResolvers;
         this._doneResolvers = [];
-        resolvers.forEach(r => r(this.position));
+        resolvers.forEach(r => r(arrived));
     }
 
     // Arm the whenDone() promise for a move that will emit 'done'.
@@ -5306,7 +5490,8 @@ class Stepper extends Extension {
 
     // whenDone({ timeout }?) — Promise for the most recent move. Resolves
     // `true` on CMD_STEPPER_DONE (or immediately if no move is pending / it
-    // already finished), `false` on the safety timeout. timeout: ms (default
+    // already finished), `false` if it didn't arrive (a gesture that gave up,
+    // or the safety timeout). timeout: ms (default
     // max(duration × 2, 10000); 0 = wait forever). Also accepts a bare
     // number: whenDone(5000).
     //
@@ -5316,7 +5501,9 @@ class Stepper extends Extension {
         const t = (typeof opts === 'number') ? opts : opts.timeout;
         const timeout = t ?? Math.max(this._moveDuration * 2, 10000);
         if (!this._movePromise) return Promise.resolve(true);
-        const done = this._movePromise.then(() => true);
+        // Settles `false` only on a gesture that gave up (DONE_GAVE_UP); every
+        // other completion (plain-move DONE, stop, disconnect) means done.
+        const done = this._movePromise.then(v => v !== false);
         if (!timeout) return done;
         return Promise.race([
             done,
@@ -5377,6 +5564,7 @@ const NEO_KHZ400 = 0x0100;
 
 class NeoPixel extends Extension {
     static deviceId = DEVICE_NEO_PIXEL;
+    static maxInstances = 4;   // board slot table (MAX_STRIPS in PardaloteNeoPixel.h)
 
     constructor() {
         super();
@@ -5425,6 +5613,15 @@ class NeoPixel extends Extension {
         this._clearPending();
         this._lastShowTime       = 0;
         this._announcedByArduino = false;
+    }
+
+    // arduino.remove() — the protocol has no strip teardown, so blank the LEDs
+    // (clear + show, sent directly — no throttle). A later add() reusing this
+    // id re-INITs the slot, which replaces the strip on the board cleanly.
+    _release() {
+        if (this.pin === -1) return;
+        this.arduino.send([encodeFrame(CMD_NEO_CLEAR, DEVICE_NEO_PIXEL, [this.logicalId]),
+                           encodeFrame(CMD_NEO_SHOW,  DEVICE_NEO_PIXEL, [this.logicalId])]);
     }
 
     _clearPending() {
@@ -5809,6 +6006,7 @@ const INCH = 1;
 
 class Ultrasonic extends Extension {
     static deviceId = DEVICE_ULTRASONIC;
+    static maxInstances = 4;   // board slot table (MAX_ULTRASONIC in PardaloteUltrasonic.h)
 
     constructor() {
         super();
@@ -6114,6 +6312,7 @@ const IMU_MODELS = {
 
 class IMU extends Extension {
     static deviceId = DEVICE_IMU;
+    static maxInstances = 2;   // board slot table (MAX_IMUS in PardaloteIMU.h)
 
     // -------------------------------------------------------------------
     // constructor(model?)
@@ -6537,6 +6736,7 @@ const CMD_ENCODER_SET_POSITION = 0x5B;
 
 class Encoder extends Extension {
     static deviceId = DEVICE_ENCODER;
+    static maxInstances = 4;   // board slot table (MAX_ENCODERS in PardaloteEncoder.h)
 
     constructor() {
         super();
@@ -6797,9 +6997,14 @@ const DEVICE_CAMERA = 204;
 const CMD_CAMERA_INIT        = 0x30;
 const CMD_CAMERA_SET_RES     = 0x31;
 const CMD_CAMERA_SET_QUALITY = 0x32;
+const CMD_CAMERA_SET_FPS     = 0x67;
 
 // -------------------------------------------------------------------
-// Framesize constants — mirror ESP32 camera framesize_t enum values.
+// Framesize constants — Pardalote's own wire codes. They follow the older
+// esp32-camera framesize_t order, but newer drivers (ESP32 core 3.x) added
+// sizes that shift the enum, so the board maps each code to its size BY NAME
+// (PardaloteCamera.h _fromWireSize). Never renumber these: deployed boards
+// and pages rely on them.
 // Pass one of these to setResolution().
 // -------------------------------------------------------------------
 const FRAMESIZE_96X96   = 0;
@@ -6829,11 +7034,12 @@ class Camera extends Extension {
 
         this.framesize = FRAMESIZE_QVGA;
         this.quality   = 12;         // 0 = best, 63 = worst (ESP32 convention)
+        this.frameRate = null;       // max stream fps; null = the board's default, 0 = no cap
     }
 
     // -------------------------------------------------------------------
     // Board switch — called by Arduino.connect() to wipe per-board state
-    // while preserving user-tuned configuration (framesize, quality).
+    // while preserving user-tuned configuration (framesize, quality, frameRate).
     // -------------------------------------------------------------------
     _reset() {
         if (this._el) {
@@ -6885,6 +7091,14 @@ class Camera extends Extension {
             CMD_CAMERA_SET_QUALITY, DEVICE_CAMERA,
             [this.logicalId, this.quality]
         ));
+        // Frame rate only once set — until then the board's default applies
+        // (and an older board that doesn't know the command never sees it).
+        if (this.frameRate !== null) {
+            this.arduino.send(encodeFrame(
+                CMD_CAMERA_SET_FPS, DEVICE_CAMERA,
+                [this.logicalId, this.frameRate]
+            ));
+        }
     }
 
     // -------------------------------------------------------------------
@@ -6929,6 +7143,23 @@ class Camera extends Extension {
         this.arduino.send(encodeFrame(
             CMD_CAMERA_SET_QUALITY, DEVICE_CAMERA,
             [this.logicalId, this.quality]
+        ));
+        return this;
+    }
+
+    // -------------------------------------------------------------------
+    // setFrameRate(fps)
+    // Cap the stream at fps frames per second (1–60); 0 removes the cap.
+    // Usually unnecessary: the board already paces the stream to the
+    // network (it pauses after each frame for half its send time), so a
+    // slow link keeps headroom and a fast one runs near the camera's limit.
+    // A cap is a fixed ceiling on top of that. Takes effect on the next frame.
+    // -------------------------------------------------------------------
+    setFrameRate(fps) {
+        this.frameRate = Math.max(0, Math.min(60, Math.round(fps)));
+        this.arduino.send(encodeFrame(
+            CMD_CAMERA_SET_FPS, DEVICE_CAMERA,
+            [this.logicalId, this.frameRate]
         ));
         return this;
     }
@@ -6993,6 +7224,7 @@ class Camera extends Extension {
             snapshotUrl: this._snapshotUrl,
             framesize:   this.framesize,
             quality:     this.quality,
+            frameRate:   this.frameRate,
         };
     }
 
@@ -7011,16 +7243,33 @@ class Camera extends Extension {
         if (!this._pendingInit) return;
         this._pendingInit = false;
 
-        const port = frame.params[1];
-        const ip   = this._extractIp();
+        // params: [id, streamPort, snapshotPort]. Snapshots have their own
+        // server on the board so they answer while a stream is running (the
+        // stream server is busy for the whole stream). Firmware from before
+        // that sends no snapshotPort — fall back to the stream port.
+        const port     = frame.params[1];
+        const snapPort = frame.params.length > 2 ? frame.params[2] : port;
+        const ip       = this._extractIp();
         if (!ip) return;
+
+        // params[3]: streams the board is serving right now. Its stream
+        // server handles one request at a time, so while another page is
+        // streaming, ours just waits — no error, a blank image. Say so,
+        // on this page's first attach only: a reconnecting page re-attaches
+        // while its OWN old stream may briefly still be counted.
+        const activeStreams = frame.params.length > 3 ? frame.params[3] : 0;
+        if (activeStreams > 0 && !this._streamUrl) {
+            this._warn('another page is already streaming from this camera. ' +
+                       'The board sends one video stream at a time, so this ' +
+                       "page's video will stay blank until that page is closed.");
+        }
 
         // Append a cache-buster so the browser opens a fresh TCP connection
         // on every reconnect, even when the Arduino's IP:port is unchanged.
         // The Arduino's wildcard URI handler strips the query string before routing.
         const t = Date.now();
         this._streamUrl   = `http://${ip}:${port}/stream?_t=${t}`;
-        this._snapshotUrl = `http://${ip}:${port}/snapshot`;
+        this._snapshotUrl = `http://${ip}:${snapPort}/snapshot`;
 
         // Abort any old lazy element before the stream event fires so the
         // browser closes the previous MJPEG connection immediately.

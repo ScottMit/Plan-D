@@ -21,52 +21,34 @@
         </div>
     </div>
 
-    <!-- Live settings. Students can try these mid-session without touching the
-         code: each <select> just updates CONFIG, and the next turn uses it.
-         Wired up in sketch.js → wireControls() (one line per control). -->
-    <div id="controls">
+    <!-- Live settings, grouped into expanding sections so students can open just
+         the one they want to try. Each control still only updates CONFIG (or
+         localStorage) and the next turn uses it — wired in sketch.js. Every
+         <details> shares the .panel look. Model is open by default because it
+         holds the Key — the one thing you must set before anything works. -->
+    <details class="panel" id="model-panel" open>
+        <summary>Model</summary>
+        <!-- Provider / Key / Model are linked: switching Provider swaps the model
+             list, the remembered model, the saved key + its hint. The <select>
+             options are built in sketch.js from each provider's own list
+             (brain.js → providers / providerModels). -->
+        <div class="row">
+            <span class="lbl">Provider</span>
+            <select id="sel-provider"></select>
+        </div>
         <div class="row">
             <span class="lbl">Key</span>
             <input id="gemini-key" class="grow" type="password" autocomplete="off"
-                   name="plan-d-key" placeholder="paste your own Gemini API key">
+                   name="plan-d-key" placeholder="paste your API key">
         </div>
         <div class="row">
             <span class="lbl"></span>
-            <span class="mut">Get one free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.</span>
+            <!-- filled per provider in sketch.js → refreshProviderUI() -->
+            <span class="mut" id="key-hint"></span>
         </div>
         <div class="row">
             <span class="lbl">Model</span>
-            <!-- Hardcoded from this key's available models (the text/chat ones).
-                 Some WILL error on purpose — e.g. gemini-2.5-flash is retired for
-                 new keys and returns a 404. Pick it and watch the ⚠ line below
-                 the face explain exactly why. Model availability changes often;
-                 refresh this list from https://ai.google.dev/gemini-api/docs/models -->
-            <select id="sel-model">
-                <optgroup label="Gemini 3 — current">
-                    <option value="gemini-3.8-flash">gemini-3.8-flash</option>
-                    <option value="gemini-3.7-flash">gemini-3.7-flash</option>
-                    <option value="gemini-3.6-flash">gemini-3.6-flash (default)</option>
-                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
-                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
-                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-                    <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
-                </optgroup>
-                <optgroup label="Aliases — always point at a current model">
-                    <option value="gemini-flash-latest">gemini-flash-latest</option>
-                    <option value="gemini-flash-lite-latest">gemini-flash-lite-latest</option>
-                    <option value="gemini-pro-latest">gemini-pro-latest</option>
-                </optgroup>
-                <optgroup label="Gemini 2.5 — older (may error)">
-                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                    <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
-                </optgroup>
-                <optgroup label="Gemma — open models (structured output may differ)">
-                    <option value="gemma-4-31b-it">gemma-4-31b-it</option>
-                    <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
-                </optgroup>
-            </select>
+            <select id="sel-model"></select>
         </div>
         <div class="row">
             <span class="lbl">Thinking</span>
@@ -76,9 +58,14 @@
                 <option value="medium">medium</option>
                 <option value="high">high — slower, more considered</option>
             </select>
-            <!-- shown by sketch.js when the chosen model isn't a Gemini 3 one -->
-            <span id="thinking-note" class="mut" hidden>Gemini 3 only — ignored for this model</span>
+            <!-- shown by sketch.js when the chosen model can't use it -->
+            <span id="thinking-note" class="mut" hidden>not available for this model</span>
         </div>
+        <p class="mut">Some models may error on purpose or be unavailable (e.g. a retired name like <code>gemini-2.5-flash</code>) — the reason shows on the ⚠ line under the face.</p>
+    </details>
+
+    <details class="panel" id="speech-panel">
+        <summary>Voice &amp; Camera</summary>
         <div class="row">
             <span class="lbl">Voice</span>
             <select id="sel-lang">
@@ -91,29 +78,51 @@
             <span class="lbl">Camera</span>
             <label class="check"><input type="checkbox" id="cam-toggle"> let the robot see (webcam)</label>
             <!-- shown by sketch.js when the chosen model can't accept an image -->
-            <span id="cam-note" class="mut" hidden>Gemini models only — Gemma can't see</span>
+            <span id="cam-note" class="mut" hidden>not available for this model</span>
         </div>
-        <div class="row">
-            <span class="lbl"></span>
-            <span class="mut">Off by default. When on, <b>one still frame</b> is sent to Gemini with each
-                turn (Gemini 3 models only) so it can react to what it sees. Frames aren't stored, but they
-                do go to Google with your key — leave it off if you'd rather not share your camera.</span>
-        </div>
-    </div>
+        <p class="mut">Camera is off by default. When on, <b>one still frame</b> is sent to Gemini with each
+            turn (Gemini 3 models only) so it can react to what it sees. Frames aren't stored, but they
+            do go to Google with your key — leave it off if you'd rather not share your camera.</p>
+    </details>
 
-    <!-- The response schema (read-only) — the exact JSON shape Gemini must return.
-         A teaching surface for structured output: the API enforces this shape, so
-         it's separate from the System prompt below (which guides the values).
-         Rendered in sketch.js → renderSchema() from Brain.responseSchema(). -->
-    <details id="schema-panel">
-        <summary>Response schema — the exact shape the model must return</summary>
+    <!-- Robot. Ticking the box builds the Pardalote hardware (robot.js →
+         enableHardware), reveals the WiFi/USB connection row (moved in here from
+         under the header) and the actuator list, and makes every gesture play on
+         the real actuators too. Wired in sketch.js → wireRobotPanel() / wireActuatorPanel(). -->
+    <details class="panel" id="robot-panel">
+        <summary>Physical Robot</summary>
+        <p class="mut">
+            Give the creature a physical body. Tick the box, connect your Pardalote board (WiFi or
+            USB), then set up the actuators you've wired. Each gesture plays on the actuators whose
+            <b>name</b> matches its lanes, as well as the on-screen face. Changes save in this browser.
+            <button type="button" id="robot-reset">Reset to defaults</button>
+        </p>
+        <div class="row">
+            <span class="lbl">Robot</span>
+            <label class="check"><input type="checkbox" id="robot-toggle"> use a physical robot</label>
+        </div>
+        <div id="robot-reveal" hidden>
+            <!-- connect.js's WiFi/USB row is relocated to just above #actuators by sketch.js -->
+            <!-- the actuator list (add/remove, type + pins, bus RX/TX) is built by sketch.js -->
+            <div id="actuators"></div>
+        </div>
+    </details>
+
+    <!-- The response schema — the exact JSON shape Gemini must return. Defined in
+         the CODE (brain.js → responseSchema) and shown here READ-ONLY. Each
+         top-level field is wired to a handler of the same name in actions.js
+         (speech → spoken, gesture → played); a field with no handler is ignored.
+         Rendered in sketch.js → renderSchema(). -->
+    <details class="panel" id="schema-panel">
+        <summary>Response Schema</summary>
         <p class="mut">
             The robot asks Gemini for <b>structured output</b>: every reply must match this JSON
             schema, and the API <b>enforces</b> it — so the chosen <code>gesture</code> is always
-            one that exists and the <code>scale</code>/<code>speed</code> levers are always present.
-            The schema fixes the <b>shape</b> (fields, types, what's required); the
-            <b>System&nbsp;prompt</b> below guides the <b>values</b> (which gesture, how big/fast,
-            what to say). It updates automatically as you add or hide gestures.
+            one that exists and the levers are always present. You edit the schema in the
+            <b>code</b> (<code>brain.js</code> → <code>responseSchema</code>) and give each field an
+            effect with a handler of the same name in <code>actions.js</code> (<code>speech</code> is
+            spoken; <code>gesture</code> is played, reading <code>scale</code>/<code>speed</code>/<code>gaze</code>);
+            a field with no handler is ignored. It updates below as you add or hide gestures.
         </p>
         <pre class="schema-code"><code id="schema-view"></code></pre>
     </details>
@@ -122,8 +131,8 @@
          inserted gesture list are joined into the instruction sent to Gemini
          (brain.js → systemInstruction). Edits save to this browser and apply on
          the next turn. Wired in sketch.js → wireControls(). -->
-    <details id="prompt-panel">
-        <summary>System prompt — rewrite how the robot behaves</summary>
+    <details class="panel" id="prompt-panel">
+        <summary>System Prompt</summary>
         <p class="mut">
             The three parts below are joined, with your authored <b>gesture list</b> inserted
             between “Reply style” and “Output rules”, and sent to Gemini as the system
@@ -158,10 +167,10 @@
          name the builder rows pan / tilt / antL / antR to match the joints.
          Per-gesture controls (play, tune) are compact icons; scale/speed/crop
          live in a ⚙ popup. Built in sketch.js → wireGesturePanel(). -->
-    <details id="gestures-panel">
-        <summary>Gestures — view, paste, and try your own</summary>
+    <details class="panel" id="gestures-panel">
+        <summary>Gestures</summary>
         <div class="gpanel-head">
-            <span class="mut">Paste a gesture from the <b>Pardalote Gesture Builder</b> into a Lanes field. Name its rows <b>pan</b> / <b>tilt</b> / <b>antL</b> / <b>antR</b>. ▶ play · ⚙ tune · 👁 LLM-visible · 💾 save · 🗑 delete. Saved edits stay in this browser.</span>
+            <span class="mut">Paste a gesture from the <b>Pardalote Gesture Builder</b> into a Lanes field. Name its rows <b>pan</b> / <b>tilt</b> / <b>antL</b> / <b>antR</b>. ▶ play · ⚙ tune · 👁 LLM-visible · 🗑 delete. Edits save to this browser when you leave a field.</span>
             <div class="gpanel-btns">
                 <button id="g-add" type="button" title="Add a new gesture">+ Add</button>
                 <button id="g-park" type="button" title="Return to rest">Park</button>
@@ -179,7 +188,7 @@
         <div id="status">Fill in config.js (copy config.example.js), then press SPACE. Serve over http://localhost so the mic works.</div>
         <div id="say-box">
             <textarea id="say" rows="2" autocomplete="off"
-                      placeholder="Type to the robot — Enter to send, Shift+Enter for a new line (or press SPACE to talk)"></textarea>
+                      placeholder="Type to the robot - enter to send"></textarea>
             <button id="send" class="primary" type="button">Send</button>
         </div>
     </div>
@@ -197,7 +206,8 @@
         'config.js',         // your settings — gitignored; copy config.example.js
         'gestures.js',       // the authored gesture vocabulary (you edit this)
         'robot.js',          // Pardalote hardware adapter
-        'brain.js',          // the Gemini call + response parsing
+        'brain.js',          // the Gemini call + the (editable) response schema
+        'actions.js',        // what each reply field DOES (schema field → handler)
         'camera.js',         // optional webcam "eyes" (opt-in)
         'sketch.js',         // p5 setup/draw, speech, the state machine
     ].forEach((src) => document.write(`<script src="${src}?v=${Date.now()}"><\/script>`));
