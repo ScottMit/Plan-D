@@ -246,6 +246,24 @@ const Brain = (() => {
                 return t;
             },
             errorMessage(data) { return (data && data.error && data.error.message) || 'request failed'; },
+
+            // List the models this key can actually reach (OpenAI-style
+            // GET …/models → { data: [ { id }, … ] }). Groq is called direct; Val
+            // goes through its relay (GET). Returns one grouped menu, or throws.
+            async listModels(key) {
+                const url = cfg.listEndpoint ? cfg.listEndpoint() : '';
+                if (!url) throw new Error('no models endpoint');
+                const res = await fetch(url, { method: 'GET', headers: { 'Authorization': `Bearer ${key}` } });
+                if (!res.ok) {
+                    const d = await res.json().catch(() => ({}));
+                    throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+                }
+                const data = await res.json();
+                const keep = cfg.listFilter || (() => true);
+                const ids = (data.data || []).map((m) => m && m.id).filter((id) => typeof id === 'string' && keep(id)).sort();
+                if (!ids.length) throw new Error('empty model list');
+                return [{ label: cfg.label, options: ids.map((id) => ({ value: id, label: id })) }];
+            },
         };
     }
 
@@ -256,6 +274,10 @@ const Brain = (() => {
         id: 'groq', label: 'Groq',
         keyHint: { placeholder: 'gsk_…', text: 'Get one at', link: 'console.groq.com/keys', url: 'https://console.groq.com/keys' },
         endpoint: () => 'https://api.groq.com/openai/v1/chat/completions',
+        // Live model list (direct). Drop the non-chat models Groq also hosts
+        // (speech, moderation, embeddings) so the menu stays to chat LLMs.
+        listEndpoint: () => 'https://api.groq.com/openai/v1/models',
+        listFilter: (id) => !/whisper|tts|text-to-speech|playai|guard|embedding|moderation/i.test(id),
         structured: 'json_object',
         vision: false,
         reasoning: true,
@@ -278,6 +300,8 @@ const Brain = (() => {
         id: 'val', label: 'RMIT Val',
         keyHint: { placeholder: 'sk-… (from your Val dashboard)', text: 'Generate one in your Val dashboard —', link: 'val-npe.rmit.edu.au', url: 'https://val-npe.rmit.edu.au/' },
         endpoint: () => (typeof VAL_PROXY_URL === 'string' ? VAL_PROXY_URL : ''),
+        // Live model list, through the same relay (a GET it forwards to /api/models).
+        listEndpoint: () => (typeof VAL_PROXY_URL === 'string' ? VAL_PROXY_URL : ''),
         structured: 'json_schema',
         vision: true,
         reasoning: false,
@@ -301,8 +325,32 @@ const Brain = (() => {
     }
     function setProviderId(id) { if (PROVIDERS[id]) { try { localStorage.setItem(PROVIDER_STORE, id); } catch (e) {} } }
     function activeProvider() { return PROVIDERS[getProviderId()] || GeminiProvider; }
-    function providerModels() { const p = activeProvider(); return p.models ? p.models() : []; }
     function providerKeyHint() { return activeProvider().keyHint || {}; }
+
+    // Model menus. A provider may offer a LIVE list (listModels) fetched with the
+    // student's key; once fetched it's cached per provider+key and used in place
+    // of the static models(). Gemini has no listModels, so it stays its curated
+    // static list. providerModels() is synchronous (for painting the menu now);
+    // fetchModels() does the async network load and fills the cache.
+    const modelCache = {};   // providerId -> { key, list }
+    function providerCanList() { return typeof activeProvider().listModels === 'function'; }
+    function providerModels() {
+        const p = activeProvider();
+        const c = modelCache[p.id];
+        if (c && c.list && c.list.length) return c.list;
+        return p.models ? p.models() : [];
+    }
+    async function fetchModels() {
+        const p = activeProvider();
+        if (typeof p.listModels !== 'function') return providerModels();
+        const key = getKey().trim();
+        if (!key) return providerModels();
+        const c = modelCache[p.id];
+        if (c && c.key === key) return c.list;    // already loaded for this key
+        const list = await p.listModels(key);
+        if (list && list.length) modelCache[p.id] = { key, list };
+        return list;
+    }
 
     // The chosen MODEL is remembered PER PROVIDER, so switching back and forth
     // keeps each service on its own last model. Defaults to the provider's default.
@@ -505,6 +553,6 @@ const Brain = (() => {
         askForDirective, getKey, setKey, supportsThinkingLevel, supportsVision,
         getPrompt, setPromptPart, promptDefaults, responseSchema,
         providers, getProviderId, setProviderId, providerModels, providerKeyHint,
-        getModel, setModel,
+        providerCanList, fetchModels, getModel, setModel,
     };
 })();

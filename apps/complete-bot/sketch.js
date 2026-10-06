@@ -653,7 +653,12 @@ function wireProviderControls(el) {
     });
 
     // Key field → the active provider's own key, saved in this browser only.
-    if (keyField) keyField.addEventListener('input', () => Brain.setKey(keyField.value));
+    // On input we just save; on change (blur/enter) we also try a live model list
+    // (some providers can list the models a key can reach — see maybeLoadModels).
+    if (keyField) {
+        keyField.addEventListener('input', () => Brain.setKey(keyField.value));
+        keyField.addEventListener('change', maybeLoadModels);
+    }
 
     refreshProviderUI();   // fill everything for the saved provider
 }
@@ -661,31 +666,11 @@ function wireProviderControls(el) {
 // Repaint the Model menu, Key field, and key hint for the ACTIVE provider, then
 // re-check which controls apply. Called on load and whenever the provider changes.
 function refreshProviderUI() {
-    const modelSel = document.getElementById('sel-model');
     const keyField = document.getElementById('gemini-key');
     const hint = document.getElementById('key-hint');
     const kh = Brain.providerKeyHint();
 
-    if (modelSel) {
-        modelSel.innerHTML = '';
-        Brain.providerModels().forEach((g) => {
-            const og = document.createElement('optgroup');
-            og.label = g.label;
-            (g.options || []).forEach((o) => {
-                const opt = document.createElement('option');
-                opt.value = o.value; opt.textContent = o.label;
-                og.appendChild(opt);
-            });
-            modelSel.appendChild(og);
-        });
-        const want = Brain.getModel();
-        modelSel.value = want;
-        // Saved model not in this provider's list → adopt (and remember) the first.
-        if (modelSel.value !== want) {
-            const first = modelSel.querySelector('option');
-            if (first) { modelSel.value = first.value; Brain.setModel(first.value); }
-        }
-    }
+    paintModelOptions();
 
     if (keyField) {
         keyField.value = Brain.getKey();
@@ -706,6 +691,47 @@ function refreshProviderUI() {
 
     updateThinkingAvailability();
     updateCameraAvailability();
+    maybeLoadModels();   // if this provider can list models and a key is set, load the live list
+}
+
+// Fill the Model <select> from the active provider's current menu (a fetched live
+// list if we have one, else the static list), keeping the remembered selection.
+function paintModelOptions() {
+    const modelSel = document.getElementById('sel-model');
+    if (!modelSel) return;
+    modelSel.innerHTML = '';
+    Brain.providerModels().forEach((g) => {
+        const og = document.createElement('optgroup');
+        og.label = g.label;
+        (g.options || []).forEach((o) => {
+            const opt = document.createElement('option');
+            opt.value = o.value; opt.textContent = o.label;
+            og.appendChild(opt);
+        });
+        modelSel.appendChild(og);
+    });
+    const want = Brain.getModel();
+    modelSel.value = want;
+    // Remembered model not in this menu → adopt (and remember) the first option.
+    if (modelSel.value !== want) {
+        const first = modelSel.querySelector('option');
+        if (first) { modelSel.value = first.value; Brain.setModel(first.value); }
+    }
+}
+
+// If the active provider offers a live model list and a key is set, fetch it in
+// the background and repaint the menu when it arrives. Failures (no key yet, relay
+// not deployed, offline) leave the static list in place — just a console note.
+function maybeLoadModels() {
+    if (!Brain.providerCanList || !Brain.providerCanList()) return;
+    if (!Brain.getKey().trim()) return;
+    const at = Brain.getProviderId();
+    Brain.fetchModels().then(() => {
+        if (Brain.getProviderId() !== at) return;   // user switched provider meanwhile
+        paintModelOptions();
+        updateThinkingAvailability();
+        updateCameraAvailability();
+    }).catch((e) => console.warn('[models] could not list ' + at + ' models:', e && e.message));
 }
 
 // Route typed text through the same loop as a spoken utterance. Interrupts a
