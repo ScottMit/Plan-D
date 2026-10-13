@@ -935,7 +935,7 @@ async function runTurn(text, sttMs = null) {
     // If this turn fell back, leave the reason in the status line — otherwise it
     // would flash past as 'speaking…' and you'd never see why it didn't work.
     setStatus(lastError ? '⚠ ' + lastError : 'idle — press SPACE to talk, or type below');
-    Robot.park();
+    // Robot.park(); // a future feature
 }
 
 function trimHistory() {
