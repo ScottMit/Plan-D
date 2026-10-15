@@ -234,6 +234,7 @@ const Robot = (() => {
         const n = actuators.filter(isBound).length;
         onStatus(`ready — ${n} actuator${n === 1 ? '' : 's'}`);
         if (CONFIG.USE_EYES) initEyes();
+        if (cameraOn) ensureCamera();   // (re)attach the board camera on connect
         park();
     }
 
@@ -346,6 +347,55 @@ const Robot = (() => {
         try { eyes.fill(rgb[0], rgb[1], rgb[2]); eyes.show(); } catch (e) {}
     }
 
+    // --- optional on-board camera (the robot's own "eyes") ------------
+    // A Pardalote Camera extension on THIS board (same connection as the servos).
+    // The browser can't read the board directly, but the camera serves its own
+    // HTTP stream + snapshot server, so we fetch stills from there. Needs WiFi
+    // (the board's IP comes from the WebSocket address — USB has none).
+    let camera = null;       // Pardalote Camera extension (lazy)
+    let cameraOn = false;    // student picked the board camera as the eyes source
+
+    function enableCamera() {
+        cameraOn = true;
+        return !!ensureCamera();   // null if the lib's missing or the board isn't built yet
+    }
+    function disableCamera() {
+        cameraOn = false;
+        if (camera) { try { camera.detach(); } catch (e) {} }
+    }
+    // Build the Camera once and attach it when the board is connected. Called from
+    // enableCamera() and again on (re)connect via onReady.
+    function ensureCamera() {
+        if (!arduino || typeof Camera === 'undefined') return null;
+        if (!camera) { camera = new Camera(); arduino.add('camera', camera); }
+        if (hardwareReady) { try { camera.attach(82); } catch (e) {} }
+        return camera;
+    }
+    function cameraRequested() { return cameraOn; }
+    // The MJPEG stream <img> for the on-canvas preview (null until the stream is up).
+    function cameraPreviewEl() { return (cameraOn && camera) ? camera.getElement() : null; }
+    // One still as base64 JPEG (no data: prefix) for brain.js, or null. Async: it
+    // fetches from the board's snapshot server.
+    async function cameraSnapshot() {
+        if (!cameraOn || !camera) return null;
+        try {
+            const url = await camera.snapshot();   // blob: URL (or null)
+            if (!url) return null;
+            const b64 = await blobUrlToBase64(url);
+            URL.revokeObjectURL(url);
+            return b64;
+        } catch (e) { return null; }
+    }
+    async function blobUrlToBase64(url) {
+        const blob = await (await fetch(url)).blob();
+        return await new Promise((resolve) => {
+            const r = new FileReader();
+            r.onloadend = () => resolve(String(r.result || '').split(',')[1] || null);
+            r.onerror = () => resolve(null);
+            r.readAsDataURL(blob);
+        });
+    }
+
     return {
         setup, isReady,
         enableHardware, disableHardware, isHardwareEnabled, connRow,
@@ -353,6 +403,7 @@ const Robot = (() => {
         gesture, play, playGesture, park, stop,
         gestureNames, gestureCatalogue, hasGesture,
         currentGaze, setEyes,
+        enableCamera, disableCamera, cameraRequested, cameraPreviewEl, cameraSnapshot,
         FILLER_GESTURE, REST_GESTURE,
     };
 })();

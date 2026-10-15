@@ -120,12 +120,21 @@ function wireControls() {
     bindSelect('sel-thinking', 'THINKING_LEVEL');
     bindSelect('sel-lang', 'SPEECH_LANG', (lang) => { if (recog) recog.lang = lang; });
 
-    // Camera toggle → the robot's optional webcam "eyes" (camera.js). Always
-    // starts OFF (privacy); ticking it asks for camera permission.
+    // Camera → the robot's optional "eyes". Off by default (privacy). The Source
+    // selector chooses the laptop webcam or the on-board Pardalote camera; ticking
+    // the box turns the chosen source on. Both go through applyEyes().
     const camToggle = el('cam-toggle');
+    const camSource = el('cam-source');
+    if (camSource) {
+        try { const s = localStorage.getItem('plan-d-eyes-source'); if (s === 'webcam' || s === 'board') camSource.value = s; } catch (e) {}
+        camSource.addEventListener('change', () => {
+            try { localStorage.setItem('plan-d-eyes-source', camSource.value); } catch (e) {}
+            applyEyes();
+        });
+    }
     if (camToggle) {
         camToggle.checked = false;
-        camToggle.addEventListener('change', () => camToggle.checked ? Webcam.enable() : Webcam.disable());
+        camToggle.addEventListener('change', applyEyes);
     }
     updateCameraAvailability();   // greys the toggle if the current model can't see
 
@@ -622,7 +631,7 @@ function updateCameraAvailability() {
     const ok = Brain.supportsVision(Brain.getModel());
     if (box) box.disabled = !ok;
     if (note) note.hidden = ok;
-    if (!ok && Webcam.isRequested()) { Webcam.disable(); if (box) box.checked = false; }
+    if (!ok && box && box.checked) { box.checked = false; Webcam.disable(); Robot.disableCamera(); }
 }
 
 // Provider / Model / Key — one linked group. The Provider dropdown switches the
@@ -760,27 +769,66 @@ function draw() {
     drawCameraPreview();
 }
 
-// A small "what I see" thumbnail in the top-right when the webcam is on — so the
-// student can see exactly the frame the robot will send. The <video> itself is
-// hidden; we draw it here.
+// The eyes source picked in the UI: 'webcam' (laptop) or 'board' (Pardalote cam).
+function eyesSource() {
+    const sel = document.getElementById('cam-source');
+    return (sel && sel.value === 'board') ? 'board' : 'webcam';
+}
+
+// Turn the chosen eyes source on/off from the Camera checkbox + Source selector.
+// Only one source runs at a time. The board camera needs the Physical robot on
+// (and connected over WiFi); if it isn't, say so and leave the box unticked.
+function applyEyes() {
+    const box = document.getElementById('cam-toggle');
+    if (!box || !box.checked) { Webcam.disable(); Robot.disableCamera(); return; }
+    if (eyesSource() === 'board') {
+        Webcam.disable();
+        if (!Robot.isHardwareEnabled()) {
+            setStatus('turn on the Physical robot (and connect over WiFi) to use the robot camera');
+            box.checked = false;
+            return;
+        }
+        Robot.enableCamera();
+    } else {
+        Robot.disableCamera();
+        Webcam.enable();
+    }
+}
+
+// One still from the active eyes source as base64 JPEG (no data: prefix), or null.
+// Async: the board camera fetches a snapshot over HTTP.
+async function currentEyesSnapshot() {
+    const box = document.getElementById('cam-toggle');
+    if (!box || !box.checked) return null;
+    return (eyesSource() === 'board') ? await Robot.cameraSnapshot() : Webcam.snapshot();
+}
+
+// A small "what I see" thumbnail in the top-right when the eyes are on — the exact
+// frame the robot will send. The webcam <video> / board-camera <img> is off-screen;
+// we draw it here.
 function drawCameraPreview() {
-    if (!Webcam.isRequested()) return;
+    const box = document.getElementById('cam-toggle');
+    if (!box || !box.checked) return;
+    const board = eyesSource() === 'board';
+    const el = board ? Robot.cameraPreviewEl() : Webcam.videoEl();
+    const vw = el ? (board ? el.naturalWidth : el.videoWidth) : 0;
+    const live = !!(el && vw > 0);
     const pw = 128, ph = 96, px = W - pw - 20, py = 20;
     push();
     rectMode(CORNER);
     noFill(); stroke(INK); strokeWeight(1.5);
     rect(px - 1, py - 1, pw + 2, ph + 2);
-    if (Webcam.isLive()) {
-        // Draw the live video straight onto the p5 canvas 2D context — reliable
-        // for a <video> element (p5's image() can miss an off-screen one).
-        drawingContext.drawImage(Webcam.videoEl(), px, py, pw, ph);
+    if (live) {
+        // Draw straight onto the p5 canvas 2D context — reliable for an off-screen
+        // <video>/<img> (p5's image() can miss one that isn't in the DOM).
+        drawingContext.drawImage(el, px, py, pw, ph);
         noStroke(); fill(TEAL); circle(px + 7, py + ph + 12, 7);
         fill(GREY); textAlign(LEFT, CENTER); textSize(11);
         text('what I see', px + 17, py + ph + 12);
     } else {
         noStroke(); fill('#efece4'); rect(px, py, pw, ph);
         fill(GREY); textAlign(CENTER, CENTER); textSize(11);
-        text('starting camera…', px + pw / 2, py + ph / 2);
+        text(board ? 'waiting for robot camera…' : 'starting camera…', px + pw / 2, py + ph / 2);
     }
     pop();
 }
@@ -882,7 +930,7 @@ async function runTurn(text, sttMs = null) {
     const tStart = performance.now();    // start the think timer
     // Grab one webcam frame NOW (what the robot saw when you spoke), or null if
     // the camera is off. It rides along to Gemini so the reply can react to it.
-    const image = Webcam.snapshot();
+    const image = await currentEyesSnapshot();
     setState(STATE.THINKING);
     setStatus('thinking…');
 

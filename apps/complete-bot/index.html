@@ -76,13 +76,21 @@
         </div>
         <div class="row">
             <span class="lbl">Camera</span>
-            <label class="check"><input type="checkbox" id="cam-toggle"> let the robot see (webcam)</label>
+            <label class="check"><input type="checkbox" id="cam-toggle"> let the robot see</label>
             <!-- shown by sketch.js when the chosen model can't accept an image -->
             <span id="cam-note" class="mut" hidden>not available for this model</span>
         </div>
-        <p class="mut">Camera is off by default. When on, <b>one still frame</b> is sent to Gemini with each
-            turn (Gemini 3 models only) so it can react to what it sees. Frames aren't stored, but they
-            do go to Google with your key — leave it off if you'd rather not share your camera.</p>
+        <div class="row">
+            <span class="lbl">Source</span>
+            <select id="cam-source">
+                <option value="webcam">Laptop webcam</option>
+                <option value="board">Robot camera (Pardalote)</option>
+            </select>
+        </div>
+        <p class="mut">Camera is off by default. When on, <b>one still frame</b> is sent with each turn (to a
+            vision-capable model) so it can react to what it sees. Frames aren't stored, but they do go to
+            the AI with your key — leave it off if you'd rather not share it. The <b>Robot camera</b> streams
+            from the Pardalote board's own camera — turn on the <b>Physical robot</b> and connect over WiFi first.</p>
     </details>
 
     <!-- Robot. Ticking the box builds the Pardalote hardware (robot.js →
